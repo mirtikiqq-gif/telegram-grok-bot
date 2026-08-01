@@ -1,0 +1,146 @@
+import requests
+from collections import defaultdict
+from telegram import Update
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    BusinessConnectionHandler,
+    ContextTypes,
+    filters,
+)
+from telegram.request import HTTPXRequest
+from telegram.error import TimedOut, NetworkError
+
+# ====== ВСТАВЬ СВОИ ДАННЫЕ ======
+BOT_TOKEN = "ТВОЙ_ТОКЕН_ОТ_BOTFATHER"
+GROQ_API_KEY = "ТВОЙ_КЛЮЧ_ОТ_GROQ"
+# ================================
+
+# История сообщений: chat_id -> список сообщений
+chat_histories = defaultdict(list)
+
+# Максимум сообщений в истории на один чат (чтобы не раздувать)
+MAX_HISTORY = 12
+
+request = HTTPXRequest(
+    connect_timeout=30.0,
+    read_timeout=30.0,
+    write_timeout=30.0,
+    pool_timeout=30.0
+)
+
+async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bc = update.business_connection
+    if bc.is_enabled:
+        print(f"✅ Подключено: {bc.user.first_name} | connection_id = {bc.id}")
+    else:
+        print(f"❌ Отключено: {bc.id}")
+
+async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.business_message
+    if not message or not message.text:
+        return
+
+    connection_id = message.business_connection_id
+    chat_id = message.chat.id
+    user_text = message.text
+    user_name = message.from_user.first_name if message.from_user else "Человек"
+
+    print(f"📩 [{user_name} | {chat_id}]: {user_text}")
+
+    # Добавляем сообщение пользователя в историю этого чата
+    chat_histories[chat_id].append({
+        "role": "user",
+        "content": user_text
+    })
+
+    # Обрезаем историю, если она слишком длинная
+    if len(chat_histories[chat_id]) > MAX_HISTORY:
+        chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY:]
+
+    # Формируем сообщения для нейросети
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты полезный ассистент, который отвечает от имени владельца аккаунта. "
+                "Отвечай коротко, естественно и на русском языке. "
+                "Помни контекст разговора с этим человеком."
+            )
+        }
+    ] + chat_histories[chat_id]
+
+    # ===== Запрос к Groq =====
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 1024,
+            },
+            timeout=40,
+        )
+
+        data = resp.json()
+
+        if "choices" in data and len(data["choices"]) > 0:
+            answer = data["choices"][0]["message"]["content"]
+        else:
+            answer = f"Ошибка API: {data}"
+            print(answer)
+
+    except Exception as e:
+        answer = f"Ошибка запроса: {e}"
+        print(answer)
+    # =========================
+
+    # Добавляем ответ бота в историю
+    chat_histories[chat_id].append({
+        "role": "assistant",
+        "content": answer
+    })
+
+    # Отправка ответа
+    for attempt in range(3):
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=answer,
+                business_connection_id=connection_id,
+                reply_to_message_id=message.message_id,
+            )
+            print(f"✅ Ответ отправлен → {user_name}")
+            break
+        except (TimedOut, NetworkError) as e:
+            print(f"⚠️ Таймаут (попытка {attempt + 1}/3): {e}")
+            if attempt == 2:
+                print("❌ Не удалось отправить сообщение")
+        except Exception as e:
+            print(f"❌ Ошибка отправки: {e}")
+            break
+
+def main():
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .build()
+    )
+
+    app.add_handler(BusinessConnectionHandler(on_business_connection))
+    app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
+
+    print("Бот запущен (с памятью по чатам)...")
+    app.run_polling(
+        allowed_updates=["business_connection", "business_message"],
+        drop_pending_updates=True
+    )
+
+if __name__ == "__main__":
+    main()
