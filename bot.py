@@ -25,9 +25,9 @@ HISTORY_FILE = "history.json"
 BLACKLIST_FILE = "blacklist.json"
 MAX_HISTORY = 16
 
-# Голос (можно менять)
-VOICE = "ru-RU-DmitryNeural"   # мужской
-# VOICE = "ru-RU-SvetlanaNeural"  # женский
+# Голос
+VOICE = "ru-RU-DmitryNeural"          # мужской
+# VOICE = "ru-RU-SvetlanaNeural"      # женский
 
 request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0, pool_timeout=30.0)
 
@@ -113,15 +113,18 @@ async def analyze_image(file_path: str, caption: str = "") -> str:
         return "что-то с фото"
 
 async def text_to_voice(text: str, path: str):
-    """Генерирует голосовое сообщение"""
     communicate = edge_tts.Communicate(text, VOICE)
     await communicate.save(path)
 
-def should_reply_with_voice(user_text: str, answer: str) -> bool:
-    """Решает, отвечать ли голосовым"""
-    # Если человек прислал голосовое — чаще отвечаем голосовым
-    # Если ответ короткий — тоже можно голосовым
-    if len(answer) < 220:
+def should_reply_with_voice(is_voice_input: bool, answer: str) -> bool:
+    """
+    Голосовым отвечаем только если:
+    - человек сам прислал голосовое
+    - и ответ относительно короткий
+    """
+    if not is_voice_input:
+        return False
+    if len(answer) < 180:
         return True
     return False
 
@@ -215,8 +218,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_histories[chat_id].append({"role": "assistant", "content": answer})
     save_history()
 
-    # === Решаем: текстом или голосовым ===
-    use_voice = is_voice_input or should_reply_with_voice(user_text, answer)
+    # Решаем способ ответа
+    use_voice = should_reply_with_voice(is_voice_input, answer)
 
     try:
         await context.bot.send_chat_action(
@@ -236,7 +239,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     business_connection_id=connection_id,
                     reply_to_message_id=message.message_id,
                 )
-            print(f"🎤 Ответил голосовым → {user_name}")
+            print(f"🎤 Голосовой ответ → {user_name}")
 
             if os.path.exists(voice_path):
                 os.remove(voice_path)
@@ -251,7 +254,6 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     except Exception as e:
         print("Ошибка отправки:", e)
-        # На всякий случай пробуем текстом
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -265,7 +267,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).request(request).build()
     app.add_handler(BusinessConnectionHandler(on_business_connection))
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
-    print("Бот запущен (текст + голосовые ответы)...")
+    print("Бот запущен (текст + умные голосовые)...")
     app.run_polling(allowed_updates=["business_connection", "business_message"], drop_pending_updates=True)
 
 if __name__ == "__main__":
