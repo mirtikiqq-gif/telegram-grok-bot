@@ -4,8 +4,9 @@ import json
 import base64
 import asyncio
 import requests
+import edge_tts
 from collections import defaultdict
-from telegram import Update, ReactionTypeEmoji
+from telegram import Update
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -20,23 +21,21 @@ from telegram.constants import ChatAction
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# === Настройки ===
 HISTORY_FILE = "history.json"
 BLACKLIST_FILE = "blacklist.json"
 MAX_HISTORY = 16
 
-# ID людей, которых бот должен игнорировать (добавляй сюда chat_id)
-# Узнать chat_id можно в логах
-BLACKLIST = set()
+# Голос (можно менять)
+VOICE = "ru-RU-DmitryNeural"   # мужской
+# VOICE = "ru-RU-SvetlanaNeural"  # женский
 
 request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0, pool_timeout=30.0)
 
 SYSTEM_PROMPT = """Ты обычный живой человек в Telegram.
 Говори естественно, коротко и по-человечески.
-Не пиши длинными простынями. Лучше 1-3 коротких сообщения.
-Можно использовать сленг и лёгкие эмодзи.
+Не пиши длинными простынями.
+Можно использовать сленг.
 Не говори, что ты бот или ИИ.
-Если вопрос простой — отвечай коротко.
 """
 
 def load_json(path, default):
@@ -55,22 +54,18 @@ def save_json(path, data):
     except Exception as e:
         print("Ошибка сохранения:", e)
 
-# Загружаем историю и чёрный список
 chat_histories = defaultdict(list, load_json(HISTORY_FILE, {}))
 BLACKLIST = set(load_json(BLACKLIST_FILE, []))
 
 def save_history():
     save_json(HISTORY_FILE, dict(chat_histories))
 
-def save_blacklist():
-    save_json(BLACKLIST_FILE, list(BLACKLIST))
-
 async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bc = update.business_connection
     if bc.is_enabled:
-        print(f"✅ Подключено: {bc.user.first_name} | {bc.id}")
+        print(f"✅ Подключено: {bc.user.first_name}")
     else:
-        print(f"❌ Отключено: {bc.id}")
+        print(f"❌ Отключено")
 
 async def transcribe_voice(file_path: str) -> str:
     try:
@@ -84,7 +79,7 @@ async def transcribe_voice(file_path: str) -> str:
             )
         return resp.json().get("text", "")
     except Exception as e:
-        print("Ошибка голосового:", e)
+        print("Ошибка STT:", e)
         return ""
 
 async def analyze_image(file_path: str, caption: str = "") -> str:
@@ -92,7 +87,7 @@ async def analyze_image(file_path: str, caption: str = "") -> str:
         with open(file_path, "rb") as f:
             img = base64.b64encode(f.read()).decode()
         mime = "image/png" if file_path.endswith(".png") else "image/jpeg"
-        prompt = caption or "Что на фото? Опиши коротко и по-человечески."
+        prompt = caption or "Что на фото? Коротко и по-человечески."
 
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -117,43 +112,18 @@ async def analyze_image(file_path: str, caption: str = "") -> str:
         print("Ошибка фото:", e)
         return "что-то с фото"
 
-def split_messages(text: str) -> list:
-    parts = [p.strip() for p in re.split(r'\n{2,}', text) if p.strip()]
-    if len(parts) >= 2:
-        return parts[:3]
-    sentences = re.split(r'(?<=[.!?…])\s+', text.strip())
-    if len(sentences) <= 2:
-        return [text.strip()]
-    result, current = [], ""
-    for s in sentences:
-        if len(current) + len(s) < 160:
-            current = (current + " " + s).strip()
-        else:
-            if current:
-                result.append(current)
-            current = s
-    if current:
-        result.append(current)
-    return result[:3]
+async def text_to_voice(text: str, path: str):
+    """Генерирует голосовое сообщение"""
+    communicate = edge_tts.Communicate(text, VOICE)
+    await communicate.save(path)
 
-async def send_human(context, chat_id, connection_id, reply_to, texts):
-    for i, text in enumerate(texts):
-        if not text:
-            continue
-        try:
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING, business_connection_id=connection_id)
-            await asyncio.sleep(0.8 + len(text) * 0.012)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                business_connection_id=connection_id,
-                reply_to_message_id=reply_to if i == 0 else None,
-            )
-            print(f"✅ {text[:50]}...")
-            if i < len(texts) - 1:
-                await asyncio.sleep(0.9)
-        except Exception as e:
-            print("Ошибка отправки:", e)
+def should_reply_with_voice(user_text: str, answer: str) -> bool:
+    """Решает, отвечать ли голосовым"""
+    # Если человек прислал голосовое — чаще отвечаем голосовым
+    # Если ответ короткий — тоже можно голосовым
+    if len(answer) < 220:
+        return True
+    return False
 
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.business_message
@@ -164,19 +134,18 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = message.chat.id
     user_name = message.from_user.first_name if message.from_user else "Человек"
     user_text = None
+    is_voice_input = False
 
-    # Чёрный список
     if chat_id in BLACKLIST:
-        print(f"⛔ Игнор {user_name} ({chat_id})")
         return
 
-    # Команда /clear
+    # Команда очистки
     if message.text and message.text.strip().lower() in ["/clear", "очистить", "забудь"]:
         chat_histories[chat_id] = []
         save_history()
         await context.bot.send_message(
             chat_id=chat_id,
-            text="окей, забыл наш разговор",
+            text="окей, забыл",
             business_connection_id=connection_id,
         )
         return
@@ -187,6 +156,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Голосовое
     elif message.voice:
+        is_voice_input = True
         print(f"🎤 {user_name}")
         try:
             f = await message.voice.get_file()
@@ -218,7 +188,6 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     print(f"📩 [{user_name}]: {user_text[:70]}")
 
-    # История
     chat_histories[chat_id].append({"role": "user", "content": user_text})
     if len(chat_histories[chat_id]) > MAX_HISTORY:
         chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY:]
@@ -233,27 +202,70 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "model": "llama-3.3-70b-versatile",
                 "messages": messages,
                 "temperature": 0.88,
-                "max_tokens": 500,
+                "max_tokens": 400,
             },
             timeout=40,
         )
         data = resp.json()
         answer = data["choices"][0]["message"]["content"].strip() if "choices" in data else "хм"
     except Exception as e:
-        answer = "сейчас туплю немного"
+        answer = "сейчас туплю"
         print(e)
 
     chat_histories[chat_id].append({"role": "assistant", "content": answer})
     save_history()
 
-    parts = split_messages(answer)
-    await send_human(context, chat_id, connection_id, message.message_id, parts)
+    # === Решаем: текстом или голосовым ===
+    use_voice = is_voice_input or should_reply_with_voice(user_text, answer)
+
+    try:
+        await context.bot.send_chat_action(
+            chat_id=chat_id,
+            action=ChatAction.RECORD_VOICE if use_voice else ChatAction.TYPING,
+            business_connection_id=connection_id
+        )
+
+        if use_voice:
+            voice_path = f"/tmp/{chat_id}_answer.mp3"
+            await text_to_voice(answer, voice_path)
+
+            with open(voice_path, "rb") as voice_file:
+                await context.bot.send_voice(
+                    chat_id=chat_id,
+                    voice=voice_file,
+                    business_connection_id=connection_id,
+                    reply_to_message_id=message.message_id,
+                )
+            print(f"🎤 Ответил голосовым → {user_name}")
+
+            if os.path.exists(voice_path):
+                os.remove(voice_path)
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=answer,
+                business_connection_id=connection_id,
+                reply_to_message_id=message.message_id,
+            )
+            print(f"✅ Текст → {user_name}")
+
+    except Exception as e:
+        print("Ошибка отправки:", e)
+        # На всякий случай пробуем текстом
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=answer,
+                business_connection_id=connection_id,
+            )
+        except:
+            pass
 
 def main():
     app = Application.builder().token(BOT_TOKEN).request(request).build()
     app.add_handler(BusinessConnectionHandler(on_business_connection))
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
-    print("Бот запущен (живой + память + /clear)...")
+    print("Бот запущен (текст + голосовые ответы)...")
     app.run_polling(allowed_updates=["business_connection", "business_message"], drop_pending_updates=True)
 
 if __name__ == "__main__":
