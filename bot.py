@@ -70,7 +70,7 @@ async def analyze_image(file_path: str, caption: str = "") -> str:
                 "Content-Type": "application/json",
             },
             json={
-                "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+               "model": "qwen/qwen3.6-27b",
                 "messages": [
                     {
                         "role": "user",
