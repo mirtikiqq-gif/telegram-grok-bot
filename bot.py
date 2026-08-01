@@ -1,3 +1,4 @@
+import os
 import requests
 from collections import defaultdict
 from telegram import Update
@@ -12,8 +13,8 @@ from telegram.request import HTTPXRequest
 from telegram.error import TimedOut, NetworkError
 
 # ====== ВСТАВЬ СВОИ ДАННЫЕ ======
-BOT_TOKEN = "ТВОЙ_ТОКЕН_ОТ_BOTFATHER"
-GROQ_API_KEY = "ТВОЙ_КЛЮЧ_ОТ_GROQ"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # ================================
 
 # История сообщений: chat_id -> список сообщений
