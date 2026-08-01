@@ -1,4 +1,5 @@
 import os
+import base64
 import requests
 from collections import defaultdict
 from telegram import Update
@@ -33,7 +34,6 @@ async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_T
         print(f"❌ Отключено: {bc.id}")
 
 async def transcribe_voice(file_path: str) -> str:
-    """Расшифровывает голосовое сообщение через Groq Whisper"""
     try:
         with open(file_path, "rb") as f:
             resp = requests.post(
@@ -49,6 +49,59 @@ async def transcribe_voice(file_path: str) -> str:
         print(f"Ошибка расшифровки: {e}")
         return ""
 
+async def analyze_image(file_path: str, caption: str = "") -> str:
+    """Анализирует изображение через Groq Vision"""
+    try:
+        with open(file_path, "rb") as f:
+            image_base64 = base64.b64encode(f.read()).decode("utf-8")
+
+        # Определяем тип изображения
+        if file_path.endswith(".png"):
+            mime = "image/png"
+        else:
+            mime = "image/jpeg"
+
+        prompt = caption if caption else "Опиши подробно, что изображено на этой картинке. Отвечай на русском."
+
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime};base64,{image_base64}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+                "temperature": 0.5,
+                "max_tokens": 1024,
+            },
+            timeout=60,
+        )
+
+        data = resp.json()
+        if "choices" in data and len(data["choices"]) > 0:
+            return data["choices"][0]["message"]["content"]
+        else:
+            print("Ошибка vision:", data)
+            return "Не удалось разобрать изображение."
+
+    except Exception as e:
+        print(f"Ошибка анализа фото: {e}")
+        return "Ошибка при обработке фото."
+
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.business_message
     if not message:
@@ -60,35 +113,51 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     user_text = None
 
-    # === Обработка текста ===
+    # === Текст ===
     if message.text:
         user_text = message.text
 
-    # === Обработка голосового ===
+    # === Голосовое ===
     elif message.voice:
         print(f"🎤 [{user_name}] прислал голосовое...")
         try:
             voice_file = await message.voice.get_file()
             file_path = f"/tmp/{chat_id}_voice.ogg"
             await voice_file.download_to_drive(file_path)
-
             user_text = await transcribe_voice(file_path)
             print(f"📝 Расшифровано: {user_text}")
-
-            # Удаляем временный файл
             if os.path.exists(file_path):
                 os.remove(file_path)
-
         except Exception as e:
-            print(f"Ошибка обработки голосового: {e}")
-            user_text = None
+            print(f"Ошибка голосового: {e}")
+            return
+
+    # === Фото ===
+    elif message.photo:
+        print(f"🖼 [{user_name}] прислал фото...")
+        try:
+            # Берём самое большое фото
+            photo = message.photo[-1]
+            photo_file = await photo.get_file()
+            file_path = f"/tmp/{chat_id}_photo.jpg"
+            await photo_file.download_to_drive(file_path)
+
+            caption = message.caption or ""
+            user_text = await analyze_image(file_path, caption)
+            print(f"👁 Распознано: {user_text[:100]}...")
+
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            print(f"Ошибка фото: {e}")
+            return
 
     if not user_text:
         return
 
-    print(f"📩 [{user_name} | {chat_id}]: {user_text}")
+    print(f"📩 [{user_name} | {chat_id}]: {user_text[:80]}...")
 
-    # Добавляем в историю
+    # История
     chat_histories[chat_id].append({"role": "user", "content": user_text})
     if len(chat_histories[chat_id]) > MAX_HISTORY:
         chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY:]
@@ -104,7 +173,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         }
     ] + chat_histories[chat_id]
 
-    # Запрос к Groq
+    # Обычный текстовый ответ
     try:
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -132,7 +201,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     chat_histories[chat_id].append({"role": "assistant", "content": answer})
 
-    # Отправка ответа
+    # Отправка
     for attempt in range(3):
         try:
             await context.bot.send_message(
@@ -146,7 +215,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         except (TimedOut, NetworkError) as e:
             print(f"⚠️ Таймаут (попытка {attempt + 1}/3): {e}")
             if attempt == 2:
-                print("❌ Не удалось отправить сообщение")
+                print("❌ Не удалось отправить")
         except Exception as e:
             print(f"❌ Ошибка отправки: {e}")
             break
@@ -162,7 +231,7 @@ def main():
     app.add_handler(BusinessConnectionHandler(on_business_connection))
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
 
-    print("Бот запущен (текст + голосовые)...")
+    print("Бот запущен (текст + голосовые + фото)...")
     app.run_polling(
         allowed_updates=["business_connection", "business_message"],
         drop_pending_updates=True
