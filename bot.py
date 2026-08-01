@@ -1,11 +1,11 @@
 import os
 import re
-import time
+import json
 import base64
 import asyncio
 import requests
 from collections import defaultdict
-from telegram import Update
+from telegram import Update, ReactionTypeEmoji
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -15,38 +15,60 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 from telegram.error import TimedOut, NetworkError
+from telegram.constants import ChatAction
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-chat_histories = defaultdict(list)
+# === Настройки ===
+HISTORY_FILE = "history.json"
+BLACKLIST_FILE = "blacklist.json"
 MAX_HISTORY = 16
 
-request = HTTPXRequest(
-    connect_timeout=30.0,
-    read_timeout=30.0,
-    write_timeout=30.0,
-    pool_timeout=30.0
-)
+# ID людей, которых бот должен игнорировать (добавляй сюда chat_id)
+# Узнать chat_id можно в логах
+BLACKLIST = set()
 
-SYSTEM_PROMPT = """Ты обычный живой человек, который переписывается в Telegram.
-Говори естественно, как в обычном чате с другом или знакомым.
+request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0, pool_timeout=30.0)
 
-Правила:
-- Не пиши длинными простынями. Лучше 1–3 коротких сообщения.
-- Можно использовать сленг, сокращения, эмодзи (но не перебарщивай).
-- Иногда можно ответить очень коротко: «ага», «понял», «хм», «ладно», «ок» и т.д.
-- Не говори, что ты бот, ИИ или ассистент.
-- Не используй слишком правильный и официальный язык.
-- Если вопрос простой — отвечай коротко.
-- Если нужно объяснить что-то — разбивай мысль на несколько сообщений.
-- Можешь проявлять эмоции, мнение, лёгкий юмор.
+SYSTEM_PROMPT = """Ты обычный живой человек в Telegram.
+Говори естественно, коротко и по-человечески.
+Не пиши длинными простынями. Лучше 1-3 коротких сообщения.
+Можно использовать сленг и лёгкие эмодзи.
+Не говори, что ты бот или ИИ.
+Если вопрос простой — отвечай коротко.
 """
+
+def load_json(path, default):
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except:
+        pass
+    return default
+
+def save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Ошибка сохранения:", e)
+
+# Загружаем историю и чёрный список
+chat_histories = defaultdict(list, load_json(HISTORY_FILE, {}))
+BLACKLIST = set(load_json(BLACKLIST_FILE, []))
+
+def save_history():
+    save_json(HISTORY_FILE, dict(chat_histories))
+
+def save_blacklist():
+    save_json(BLACKLIST_FILE, list(BLACKLIST))
 
 async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bc = update.business_connection
     if bc.is_enabled:
-        print(f"✅ Подключено: {bc.user.first_name} | connection_id = {bc.id}")
+        print(f"✅ Подключено: {bc.user.first_name} | {bc.id}")
     else:
         print(f"❌ Отключено: {bc.id}")
 
@@ -60,99 +82,78 @@ async def transcribe_voice(file_path: str) -> str:
                 data={"model": "whisper-large-v3", "language": "ru"},
                 timeout=60,
             )
-        data = resp.json()
-        return data.get("text", "")
+        return resp.json().get("text", "")
     except Exception as e:
-        print(f"Ошибка расшифровки: {e}")
+        print("Ошибка голосового:", e)
         return ""
 
 async def analyze_image(file_path: str, caption: str = "") -> str:
     try:
         with open(file_path, "rb") as f:
-            image_base64 = base64.b64encode(f.read()).decode("utf-8")
-
+            img = base64.b64encode(f.read()).decode()
         mime = "image/png" if file_path.endswith(".png") else "image/jpeg"
-        prompt = caption if caption else "Что на этом фото? Опиши коротко и по-человечески."
+        prompt = caption or "Что на фото? Опиши коротко и по-человечески."
 
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json={
                 "model": "qwen/qwen3.6-27b",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:{mime};base64,{image_base64}"},
-                            },
-                        ],
-                    }
-                ],
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img}"}}
+                    ]
+                }],
                 "temperature": 0.6,
-                "max_tokens": 500,
+                "max_tokens": 400,
             },
             timeout=60,
         )
         data = resp.json()
-        if "choices" in data and data["choices"]:
-            return data["choices"][0]["message"]["content"]
-        return "Не понял, что на фото."
+        return data["choices"][0]["message"]["content"] if "choices" in data else "не понял фото"
     except Exception as e:
-        print(f"Ошибка фото: {e}")
-        return "Что-то с фото не так."
+        print("Ошибка фото:", e)
+        return "что-то с фото"
 
-def split_into_messages(text: str) -> list:
-    """Разбивает длинный ответ на несколько коротких сообщений"""
-    # Сначала пробуем разбить по двойным переносам
+def split_messages(text: str) -> list:
     parts = [p.strip() for p in re.split(r'\n{2,}', text) if p.strip()]
-    
     if len(parts) >= 2:
-        return parts[:4]  # максимум 4 сообщения
-
-    # Если нет явных абзацев — режем по предложениям
+        return parts[:3]
     sentences = re.split(r'(?<=[.!?…])\s+', text.strip())
     if len(sentences) <= 2:
         return [text.strip()]
-
-    messages = []
-    current = ""
+    result, current = [], ""
     for s in sentences:
-        if len(current) + len(s) < 180:
+        if len(current) + len(s) < 160:
             current = (current + " " + s).strip()
         else:
             if current:
-                messages.append(current)
+                result.append(current)
             current = s
     if current:
-        messages.append(current)
+        result.append(current)
+    return result[:3]
 
-    return messages[:4]
-
-async def send_human_like(context, chat_id, connection_id, reply_to, texts: list):
-    """Отправляет несколько сообщений с паузами"""
+async def send_human(context, chat_id, connection_id, reply_to, texts):
     for i, text in enumerate(texts):
         if not text:
             continue
         try:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING, business_connection_id=connection_id)
+            await asyncio.sleep(0.8 + len(text) * 0.012)
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=text,
                 business_connection_id=connection_id,
                 reply_to_message_id=reply_to if i == 0 else None,
             )
-            print(f"✅ Отправлено: {text[:60]}...")
-            
-            # Пауза между сообщениями (имитация печати)
+            print(f"✅ {text[:50]}...")
             if i < len(texts) - 1:
-                await asyncio.sleep(1.2 + len(text) * 0.015)
+                await asyncio.sleep(0.9)
         except Exception as e:
-            print(f"❌ Ошибка отправки: {e}")
+            print("Ошибка отправки:", e)
 
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.business_message
@@ -164,45 +165,58 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_name = message.from_user.first_name if message.from_user else "Человек"
     user_text = None
 
+    # Чёрный список
+    if chat_id in BLACKLIST:
+        print(f"⛔ Игнор {user_name} ({chat_id})")
+        return
+
+    # Команда /clear
+    if message.text and message.text.strip().lower() in ["/clear", "очистить", "забудь"]:
+        chat_histories[chat_id] = []
+        save_history()
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="окей, забыл наш разговор",
+            business_connection_id=connection_id,
+        )
+        return
+
     # Текст
     if message.text:
         user_text = message.text
 
     # Голосовое
     elif message.voice:
-        print(f"🎤 [{user_name}] голосовое...")
+        print(f"🎤 {user_name}")
         try:
-            voice_file = await message.voice.get_file()
-            path = f"/tmp/{chat_id}_voice.ogg"
-            await voice_file.download_to_drive(path)
+            f = await message.voice.get_file()
+            path = f"/tmp/{chat_id}_v.ogg"
+            await f.download_to_drive(path)
             user_text = await transcribe_voice(path)
             if os.path.exists(path):
                 os.remove(path)
-            print(f"📝 → {user_text}")
         except Exception as e:
-            print(f"Ошибка голосового: {e}")
+            print(e)
             return
 
     # Фото
     elif message.photo:
-        print(f"🖼 [{user_name}] фото...")
+        print(f"🖼 {user_name}")
         try:
-            photo = message.photo[-1]
-            photo_file = await photo.get_file()
-            path = f"/tmp/{chat_id}_photo.jpg"
-            await photo_file.download_to_drive(path)
+            f = await message.photo[-1].get_file()
+            path = f"/tmp/{chat_id}_p.jpg"
+            await f.download_to_drive(path)
             user_text = await analyze_image(path, message.caption or "")
             if os.path.exists(path):
                 os.remove(path)
-            print(f"👁 → {user_text[:80]}...")
         except Exception as e:
-            print(f"Ошибка фото: {e}")
+            print(e)
             return
 
     if not user_text:
         return
 
-    print(f"📩 [{user_name}]: {user_text[:80]}")
+    print(f"📩 [{user_name}]: {user_text[:70]}")
 
     # История
     chat_histories[chat_id].append({"role": "user", "content": user_text})
@@ -211,54 +225,36 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + chat_histories[chat_id]
 
-    # Генерация ответа
     try:
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json={
                 "model": "llama-3.3-70b-versatile",
                 "messages": messages,
-                "temperature": 0.85,
-                "max_tokens": 600,
+                "temperature": 0.88,
+                "max_tokens": 500,
             },
             timeout=40,
         )
         data = resp.json()
-        if "choices" in data and data["choices"]:
-            raw_answer = data["choices"][0]["message"]["content"].strip()
-        else:
-            raw_answer = "хм, что-то пошло не так"
-            print(data)
+        answer = data["choices"][0]["message"]["content"].strip() if "choices" in data else "хм"
     except Exception as e:
-        raw_answer = "сейчас немного туплю, повтори"
+        answer = "сейчас туплю немного"
         print(e)
 
-    # Сохраняем в историю цельный ответ
-    chat_histories[chat_id].append({"role": "assistant", "content": raw_answer})
+    chat_histories[chat_id].append({"role": "assistant", "content": answer})
+    save_history()
 
-    # Разбиваем и отправляем как человек
-    parts = split_into_messages(raw_answer)
-    await send_human_like(context, chat_id, connection_id, message.message_id, parts)
+    parts = split_messages(answer)
+    await send_human(context, chat_id, connection_id, message.message_id, parts)
 
 def main():
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .request(request)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).request(request).build()
     app.add_handler(BusinessConnectionHandler(on_business_connection))
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
-
-    print("Бот запущен (живой стиль)...")
-    app.run_polling(
-        allowed_updates=["business_connection", "business_message"],
-        drop_pending_updates=True
-    )
+    print("Бот запущен (живой + память + /clear)...")
+    app.run_polling(allowed_updates=["business_connection", "business_message"], drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
