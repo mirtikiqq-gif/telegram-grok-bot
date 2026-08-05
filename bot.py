@@ -23,7 +23,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # Имя бота (для упоминаний в группе)
 BOT_NAME = "мику"
-BOT_USERNAMES = ["groooooook_bot"]  # свой username бота без @ (можно несколько)
+BOT_USERNAMES = ["@grooooooook_bot"]  # свой username бота без @ (можно несколько)
 
 HISTORY_FILE = "history.json"
 FACTS_FILE = "facts.json"
