@@ -6,7 +6,6 @@ import base64
 import asyncio
 import requests
 import edge_tts
-from datetime import datetime
 from collections import defaultdict
 from telegram import Update, ReactionTypeEmoji
 from telegram.ext import (
@@ -21,10 +20,7 @@ from telegram.constants import ChatAction
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-# Твой Telegram ID (чтобы команды /off /on /role работали только от тебя)
-# Узнать можно у @userinfobot
-OWNER_ID = os.getenv("OWNER_ID")  # строка, например "123456789"
+OWNER_ID = os.getenv("OWNER_ID")
 
 HISTORY_FILE = "history.json"
 FACTS_FILE = "facts.json"
@@ -148,7 +144,6 @@ async def analyze_image(file_path: str, caption: str = "") -> str:
         return "что-то с фото"
 
 async def detect_mood(text: str) -> str:
-    """Определяет настроение человека"""
     result = await call_groq(
         [
             {
@@ -166,30 +161,6 @@ async def detect_mood(text: str) -> str:
         max_tokens=10,
     )
     return (result or "нейтральный").lower().strip()
-
-async def should_reply(text: str) -> bool:
-    """Решает, нужно ли вообще отвечать"""
-    # Короткие реакции часто не требуют ответа
-    if text.lower().strip() in ["ок", "окей", "ладно", "ага", "угу", "понял", "ясно", "спс", "спасибо", "👍", "😂", "🔥"]:
-        return random.random() < 0.35
-
-    result = await call_groq(
-        [
-            {
-                "role": "system",
-                "content": (
-                    "Нужно ли отвечать на это сообщение в переписке? "
-                    "Ответь только YES или NO. "
-                    "NO — если это просто реакция, подтверждение, стикер-текст или сообщение не требует ответа."
-                )
-            },
-            {"role": "user", "content": text}
-        ],
-        model="llama-3.1-8b-instant",
-        temperature=0.1,
-        max_tokens=5,
-    )
-    return result is None or "YES" in (result or "").upper()
 
 async def extract_facts(chat_id: str, text: str):
     if len(text) < 30 or random.random() > 0.4:
@@ -276,11 +247,9 @@ def should_reply_with_voice(is_voice_input: bool, answer: str) -> bool:
 def build_system_prompt(chat_id: str, mood: str) -> str:
     prompt = BASE_PROMPT
 
-    # Роль
     if settings.get("role"):
         prompt += f"\n\nСейчас ты в роли: {settings['role']}"
 
-    # Настроение
     mood_hints = {
         "злой": "Человек раздражён или зол. Отвечай спокойно, коротко, без лишних шуток.",
         "грустный": "Человек грустит. Будь мягче и теплее обычного.",
@@ -292,7 +261,6 @@ def build_system_prompt(chat_id: str, mood: str) -> str:
     if mood in mood_hints:
         prompt += f"\n\n{mood_hints[mood]}"
 
-    # Факты
     facts = user_facts.get(chat_id, [])
     if facts:
         prompt += "\n\nЧто ты знаешь об этом человеке:\n- " + "\n- ".join(facts[-8:])
@@ -300,10 +268,9 @@ def build_system_prompt(chat_id: str, mood: str) -> str:
     return prompt
 
 async def handle_owner_commands(text: str, chat_id: str, context, connection_id) -> bool:
-    """Обработка команд владельца. Возвращает True, если команда обработана."""
-    text = text.strip().lower()
+    text_l = text.strip().lower()
 
-    if text in ["/off", "выкл", "выключить"]:
+    if text_l in ["/off", "выкл", "выключить"]:
         settings["enabled"] = False
         save_all()
         await context.bot.send_message(
@@ -313,7 +280,7 @@ async def handle_owner_commands(text: str, chat_id: str, context, connection_id)
         )
         return True
 
-    if text in ["/on", "вкл", "включить"]:
+    if text_l in ["/on", "вкл", "включить"]:
         settings["enabled"] = True
         save_all()
         await context.bot.send_message(
@@ -323,9 +290,9 @@ async def handle_owner_commands(text: str, chat_id: str, context, connection_id)
         )
         return True
 
-    if text.startswith("/role ") or text.startswith("роль "):
+    if text_l.startswith("/role ") or text_l.startswith("роль "):
         role = text.split(" ", 1)[1].strip()
-        settings["role"] = role if role not in ["сброс", "off", "нет"] else None
+        settings["role"] = role if role.lower() not in ["сброс", "off", "нет"] else None
         save_all()
         msg = f"роль: {settings['role']}" if settings["role"] else "роль сброшена"
         await context.bot.send_message(
@@ -335,7 +302,7 @@ async def handle_owner_commands(text: str, chat_id: str, context, connection_id)
         )
         return True
 
-    if text in ["/summary", "саммари", "о чём говорили"]:
+    if text_l in ["/summary", "саммари", "о чём говорили"]:
         history = chat_histories.get(chat_id, [])
         if not history:
             await context.bot.send_message(
@@ -370,7 +337,7 @@ async def handle_owner_commands(text: str, chat_id: str, context, connection_id)
         )
         return True
 
-    if text in ["/clear", "очистить", "забудь"]:
+    if text_l in ["/clear", "очистить", "забудь"]:
         chat_histories[chat_id] = []
         user_facts[chat_id] = []
         save_all()
@@ -397,19 +364,14 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if chat_id in BLACKLIST:
         return
 
-    # Бот выключен
     if not settings.get("enabled", True):
         return
 
-    # Текст / команды
     if message.text:
         user_text = message.text
-
-        # Команды (работают для всех, но особенно полезны тебе)
         if await handle_owner_commands(user_text, chat_id, context, connection_id):
             return
 
-    # Голосовое
     elif message.voice:
         is_voice_input = True
         print(f"🎤 {user_name}")
@@ -424,7 +386,6 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             print(e)
             return
 
-    # Фото
     elif message.photo:
         print(f"🖼 {user_name}")
         try:
@@ -443,21 +404,11 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     print(f"📩 [{user_name}]: {user_text[:80]}")
 
-    # Иногда не отвечаем
-    if not await should_reply(user_text):
-        print("🤫 Решил не отвечать")
-        await maybe_react(context, chat_id, message.message_id, connection_id)
-        return
-
-    # Реакция
     await maybe_react(context, chat_id, message.message_id, connection_id)
-
-    # Факты + настроение
     await extract_facts(chat_id, user_text)
     mood = await detect_mood(user_text)
     print(f"😊 Настроение: {mood}")
 
-    # История
     chat_histories[chat_id].append({"role": "user", "content": user_text})
     if len(chat_histories[chat_id]) > MAX_HISTORY:
         chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY:]
@@ -521,7 +472,7 @@ def main():
     app.add_handler(BusinessConnectionHandler(on_business_connection))
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
 
-    print("Бот запущен (умные фичи + вау)...")
+    print("Бот запущен (всегда отвечает)...")
     print(f"Статус: {'ВКЛ' if settings.get('enabled', True) else 'ВЫКЛ'}")
     app.run_polling(
         allowed_updates=["business_connection", "business_message"],
