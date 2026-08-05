@@ -20,7 +20,6 @@ from telegram.constants import ChatAction
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-OWNER_ID = os.getenv("OWNER_ID")
 
 HISTORY_FILE = "history.json"
 FACTS_FILE = "facts.json"
@@ -60,7 +59,7 @@ def save_json(path, data):
 raw_history = load_json(HISTORY_FILE, {})
 raw_facts = load_json(FACTS_FILE, {})
 raw_blacklist = load_json(BLACKLIST_FILE, [])
-settings = load_json(SETTINGS_FILE, {"enabled": True, "role": None})
+settings = load_json(SETTINGS_FILE, {"role": None})
 
 chat_histories = defaultdict(list, {str(k): v for k, v in raw_history.items()})
 user_facts = defaultdict(list, {str(k): v for k, v in raw_facts.items()})
@@ -267,28 +266,8 @@ def build_system_prompt(chat_id: str, mood: str) -> str:
 
     return prompt
 
-async def handle_owner_commands(text: str, chat_id: str, context, connection_id) -> bool:
+async def handle_commands(text: str, chat_id: str, context, connection_id) -> bool:
     text_l = text.strip().lower()
-
-    if text_l in ["/off", "выкл", "выключить"]:
-        settings["enabled"] = False
-        save_all()
-        await context.bot.send_message(
-            chat_id=int(chat_id),
-            text="бот выключен",
-            business_connection_id=connection_id,
-        )
-        return True
-
-    if text_l in ["/on", "вкл", "включить"]:
-        settings["enabled"] = True
-        save_all()
-        await context.bot.send_message(
-            chat_id=int(chat_id),
-            text="бот включен",
-            business_connection_id=connection_id,
-        )
-        return True
 
     if text_l.startswith("/role ") or text_l.startswith("роль "):
         role = text.split(" ", 1)[1].strip()
@@ -364,12 +343,9 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if chat_id in BLACKLIST:
         return
 
-    if not settings.get("enabled", True):
-        return
-
     if message.text:
         user_text = message.text
-        if await handle_owner_commands(user_text, chat_id, context, connection_id):
+        if await handle_commands(user_text, chat_id, context, connection_id):
             return
 
     elif message.voice:
@@ -472,8 +448,7 @@ def main():
     app.add_handler(BusinessConnectionHandler(on_business_connection))
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
 
-    print("Бот запущен (всегда отвечает)...")
-    print(f"Статус: {'ВКЛ' if settings.get('enabled', True) else 'ВЫКЛ'}")
+    print("Бот запущен...")
     app.run_polling(
         allowed_updates=["business_connection", "business_message"],
         drop_pending_updates=True
