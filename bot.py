@@ -21,8 +21,11 @@ from telegram.constants import ChatAction
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+# === АДМИН ===
+OWNER_USERNAME = "Mirtik_qq_I"  # твой юзернейм без @
+
 BOT_NAME = "мику"
-BOT_USERNAMES = ["@grooooooook_bot"]  # свой username без @
+BOT_USERNAMES = ["@grooooooook_bot"]
 
 HISTORY_FILE = "history.json"
 FACTS_FILE = "facts.json"
@@ -64,7 +67,7 @@ def save_json(path, data):
 raw_history = load_json(HISTORY_FILE, {})
 raw_facts = load_json(FACTS_FILE, {})
 raw_blacklist = load_json(BLACKLIST_FILE, [])
-settings = load_json(SETTINGS_FILE, {"role": None})
+settings = load_json(SETTINGS_FILE, {"role": None, "muted": False})
 
 chat_histories = defaultdict(list, {str(k): v for k, v in raw_history.items()})
 user_facts = defaultdict(list, {str(k): v for k, v in raw_facts.items()})
@@ -75,6 +78,11 @@ def save_all():
     save_json(FACTS_FILE, dict(user_facts))
     save_json(BLACKLIST_FILE, list(BLACKLIST))
     save_json(SETTINGS_FILE, settings)
+
+def is_owner(user) -> bool:
+    if not user or not user.username:
+        return False
+    return user.username.lower() == OWNER_USERNAME.lower()
 
 def is_mentioned(text: str, bot_username: str = None) -> bool:
     if not text:
@@ -290,11 +298,30 @@ def build_system_prompt(chat_id: str, mood: str) -> str:
 
     return prompt
 
-async def handle_commands(text: str, chat_id: str, context, connection_id=None) -> bool:
+async def handle_commands(text: str, chat_id: str, context, user, connection_id=None) -> bool:
+    """Команды только от админа"""
+    if not is_owner(user):
+        return False
+
     text_l = (text or "").strip().lower()
     kwargs = {"chat_id": int(chat_id)}
     if connection_id:
         kwargs["business_connection_id"] = connection_id
+
+    # Мут / размут
+    if text_l in ["/m1", "m1"]:
+        settings["muted"] = True
+        save_all()
+        await context.bot.send_message(text="замучена... ммм >_<", **kwargs)
+        print("🔇 Мут включён")
+        return True
+
+    if text_l in ["/m0", "m0"]:
+        settings["muted"] = False
+        save_all()
+        await context.bot.send_message(text="размутили~ ура!", **kwargs)
+        print("🔊 Мут выключен")
+        return True
 
     if text_l.startswith("/role ") or text_l.startswith("роль "):
         role = text.split(" ", 1)[1].strip()
@@ -350,6 +377,11 @@ async def process_message(
     is_voice_input: bool = False,
     is_group: bool = False,
 ):
+    # Если замучена — не отвечаем
+    if settings.get("muted", False):
+        print("🔇 Замучена, пропускаю")
+        return
+
     print(f"📩 [{'группа' if is_group else 'личка'}] [{user_name}]: {user_text[:80]}")
 
     await maybe_react(context, chat_id, message_id, connection_id)
@@ -410,156 +442,4 @@ async def process_message(
     except Exception as e:
         print("Ошибка отправки:", e)
 
-async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.business_message
-    if not message:
-        return
-
-    connection_id = message.business_connection_id
-    chat_id = str(message.chat.id)
-    user_name = message.from_user.first_name if message.from_user else "человек"
-    user_text = None
-    is_voice_input = False
-
-    if chat_id in BLACKLIST:
-        return
-
-    if message.text:
-        user_text = message.text
-        if await handle_commands(user_text, chat_id, context, connection_id):
-            return
-
-    elif message.voice:
-        is_voice_input = True
-        try:
-            f = await message.voice.get_file()
-            path = f"/tmp/{chat_id}_v.ogg"
-            await f.download_to_drive(path)
-            user_text = await transcribe_voice(path)
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception as e:
-            print(e)
-            return
-
-    elif message.photo:
-        try:
-            f = await message.photo[-1].get_file()
-            path = f"/tmp/{chat_id}_p.jpg"
-            await f.download_to_drive(path)
-            user_text = await analyze_image(path, message.caption or "")
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception as e:
-            print(e)
-            return
-
-    if not user_text:
-        return
-
-    await process_message(
-        context, chat_id, user_name, user_text,
-        message.message_id, connection_id, is_voice_input, is_group=False
-    )
-
-async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message:
-        return
-
-    if message.chat.type not in ["group", "supergroup"]:
-        return
-
-    chat_id = str(message.chat.id)
-    user_name = message.from_user.first_name if message.from_user else "человек"
-
-    if chat_id in BLACKLIST:
-        return
-
-    bot_me = await context.bot.get_me()
-    bot_username = bot_me.username
-    bot_id = bot_me.id
-
-    # Проверяем: упомянули ИЛИ ответили на сообщение бота
-    is_reply_to_bot = (
-        message.reply_to_message
-        and message.reply_to_message.from_user
-        and message.reply_to_message.from_user.id == bot_id
-    )
-
-    text_for_mention = message.text or message.caption or ""
-    mentioned = is_mentioned(text_for_mention, bot_username)
-
-    if not mentioned and not is_reply_to_bot:
-        return
-
-    # Команды (только из текста)
-    if message.text and await handle_commands(message.text, chat_id, context):
-        return
-
-    user_text = None
-    is_voice_input = False
-
-    # Текст
-    if message.text:
-        user_text = clean_mention(message.text) if mentioned else message.text
-        if not user_text:
-            user_text = "привет"
-
-    # Голосовое
-    elif message.voice:
-        is_voice_input = True
-        try:
-            f = await message.voice.get_file()
-            path = f"/tmp/{chat_id}_v.ogg"
-            await f.download_to_drive(path)
-            user_text = await transcribe_voice(path)
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception as e:
-            print("Группа голосовое:", e)
-            return
-
-    # Фото
-    elif message.photo:
-        try:
-            f = await message.photo[-1].get_file()
-            path = f"/tmp/{chat_id}_p.jpg"
-            await f.download_to_drive(path)
-            caption = clean_mention(message.caption) if message.caption else ""
-            user_text = await analyze_image(path, caption)
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception as e:
-            print("Группа фото:", e)
-            return
-
-    if not user_text:
-        return
-
-    await process_message(
-        context, chat_id, user_name, user_text,
-        message.message_id, connection_id=None,
-        is_voice_input=is_voice_input, is_group=True
-    )
-
-def main():
-    app = Application.builder().token(BOT_TOKEN).request(request).build()
-
-    app.add_handler(BusinessConnectionHandler(on_business_connection))
-    app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
-
-    # Группы: текст, фото, голосовые
-    app.add_handler(MessageHandler(
-        (filters.TEXT | filters.PHOTO | filters.VOICE) & filters.ChatType.GROUPS,
-        on_group_message
-    ))
-
-    print("Мику запущена~ (группы + фото + reply)")
-    app.run_polling(
-        allowed_updates=["business_connection", "business_message", "message"],
-        drop_pending_updates=True
-    )
-
-if __name__ == "__main__":
-    main()
+async def on_business_
