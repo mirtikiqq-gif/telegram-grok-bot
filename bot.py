@@ -6,6 +6,7 @@ import base64
 import asyncio
 import requests
 import edge_tts
+from datetime import datetime
 from collections import defaultdict
 from telegram import Update, ReactionTypeEmoji
 from telegram.ext import (
@@ -21,27 +22,27 @@ from telegram.constants import ChatAction
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+# Твой Telegram ID (чтобы команды /off /on /role работали только от тебя)
+# Узнать можно у @userinfobot
+OWNER_ID = os.getenv("OWNER_ID")  # строка, например "123456789"
+
 HISTORY_FILE = "history.json"
 FACTS_FILE = "facts.json"
 BLACKLIST_FILE = "blacklist.json"
-MAX_HISTORY = 16
+SETTINGS_FILE = "settings.json"
+MAX_HISTORY = 18
 
 VOICE = "ru-RU-DmitryNeural"
 REACTIONS = ["👍", "🔥", "😂", "❤️", "😮", "👏", "💯"]
 
-request = HTTPXRequest(
-    connect_timeout=30.0,
-    read_timeout=30.0,
-    write_timeout=30.0,
-    pool_timeout=30.0
-)
+request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0, pool_timeout=30.0)
 
-SYSTEM_PROMPT = """Ты обычный живой человек в Telegram.
+BASE_PROMPT = """Ты обычный живой человек в Telegram.
 Говори естественно, коротко и по-человечески.
 Не пиши одной длинной простынёй — лучше 1-3 коротких сообщения.
 Можно использовать сленг.
-Не говори, что ты бот или ИИ.
-Если знаешь факты о человеке — учитывай их естественно, не перечисляй их прямо.
+Никогда не говори, что ты бот, ИИ или ассистент.
+Если знаешь факты о человеке — учитывай их естественно.
 """
 
 def load_json(path, default):
@@ -60,10 +61,10 @@ def save_json(path, data):
     except Exception as e:
         print(f"Ошибка сохранения {path}:", e)
 
-# Всегда храним ключи как строки
 raw_history = load_json(HISTORY_FILE, {})
 raw_facts = load_json(FACTS_FILE, {})
 raw_blacklist = load_json(BLACKLIST_FILE, [])
+settings = load_json(SETTINGS_FILE, {"enabled": True, "role": None})
 
 chat_histories = defaultdict(list, {str(k): v for k, v in raw_history.items()})
 user_facts = defaultdict(list, {str(k): v for k, v in raw_facts.items()})
@@ -73,6 +74,7 @@ def save_all():
     save_json(HISTORY_FILE, dict(chat_histories))
     save_json(FACTS_FILE, dict(user_facts))
     save_json(BLACKLIST_FILE, list(BLACKLIST))
+    save_json(SETTINGS_FILE, settings)
 
 async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bc = update.business_connection
@@ -80,6 +82,31 @@ async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_T
         print(f"✅ Подключено: {bc.user.first_name}")
     else:
         print("❌ Отключено")
+
+async def call_groq(messages, model="llama-3.3-70b-versatile", temperature=0.85, max_tokens=500):
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            },
+            timeout=45,
+        )
+        data = resp.json()
+        if "choices" in data and data["choices"]:
+            return data["choices"][0]["message"]["content"].strip()
+        print("Groq error:", data)
+        return None
+    except Exception as e:
+        print("Groq exception:", e)
+        return None
 
 async def transcribe_voice(file_path: str) -> str:
     try:
@@ -93,7 +120,7 @@ async def transcribe_voice(file_path: str) -> str:
             )
         return resp.json().get("text", "")
     except Exception as e:
-        print("Ошибка STT:", e)
+        print("STT error:", e)
         return ""
 
 async def analyze_image(file_path: str, caption: str = "") -> str:
@@ -101,91 +128,101 @@ async def analyze_image(file_path: str, caption: str = "") -> str:
         with open(file_path, "rb") as f:
             img = base64.b64encode(f.read()).decode()
         mime = "image/png" if file_path.endswith(".png") else "image/jpeg"
-        prompt = caption or "Что на фото? Коротко и по-человечески."
+        prompt = caption or "Что на фото? Опиши коротко и по-человечески."
 
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "qwen/qwen3.6-27b",
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img}"}}
-                    ]
-                }],
-                "temperature": 0.6,
-                "max_tokens": 400,
-            },
-            timeout=60,
+        result = await call_groq(
+            [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img}"}}
+                ]
+            }],
+            model="qwen/qwen3.6-27b",
+            temperature=0.5,
+            max_tokens=350,
         )
-        data = resp.json()
-        if "choices" in data and data["choices"]:
-            return data["choices"][0]["message"]["content"]
-        return "не понял фото"
+        return result or "не понял фото"
     except Exception as e:
-        print("Ошибка фото:", e)
+        print("Vision error:", e)
         return "что-то с фото"
 
+async def detect_mood(text: str) -> str:
+    """Определяет настроение человека"""
+    result = await call_groq(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Определи настроение сообщения одним словом: "
+                    "нейтральный, весёлый, грустный, злой, усталый, влюблённый, тревожный, шутит. "
+                    "Ответь только одним словом."
+                )
+            },
+            {"role": "user", "content": text}
+        ],
+        model="llama-3.1-8b-instant",
+        temperature=0.1,
+        max_tokens=10,
+    )
+    return (result or "нейтральный").lower().strip()
+
+async def should_reply(text: str) -> bool:
+    """Решает, нужно ли вообще отвечать"""
+    # Короткие реакции часто не требуют ответа
+    if text.lower().strip() in ["ок", "окей", "ладно", "ага", "угу", "понял", "ясно", "спс", "спасибо", "👍", "😂", "🔥"]:
+        return random.random() < 0.35
+
+    result = await call_groq(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Нужно ли отвечать на это сообщение в переписке? "
+                    "Ответь только YES или NO. "
+                    "NO — если это просто реакция, подтверждение, стикер-текст или сообщение не требует ответа."
+                )
+            },
+            {"role": "user", "content": text}
+        ],
+        model="llama-3.1-8b-instant",
+        temperature=0.1,
+        max_tokens=5,
+    )
+    return result is None or "YES" in (result or "").upper()
+
 async def extract_facts(chat_id: str, text: str):
-    """Извлекает факты только если сообщение достаточно информативное"""
-    if len(text) < 25:
+    if len(text) < 30 or random.random() > 0.4:
         return
 
-    # Не на каждое сообщение
-    if random.random() > 0.45:
+    result = await call_groq(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Извлеки только явные факты о человеке. "
+                    "Если фактов нет — верни пустую строку. "
+                    "Каждый факт с новой строки, коротко."
+                )
+            },
+            {"role": "user", "content": text}
+        ],
+        model="llama-3.1-8b-instant",
+        temperature=0.1,
+        max_tokens=120,
+    )
+
+    if not result or result.lower() in ["нет", "нет фактов", "пусто"]:
         return
 
-    try:
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama-3.1-8b-instant",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Извлеки только явные факты о человеке. "
-                            "Если фактов нет — верни пустую строку. "
-                            "Пиши каждый факт с новой строки, коротко. "
-                            "Примеры: Живёт в Москве\nЛюбит аниме\nУчится на программиста"
-                        )
-                    },
-                    {"role": "user", "content": text}
-                ],
-                "temperature": 0.1,
-                "max_tokens": 120,
-            },
-            timeout=20,
-        )
-        data = resp.json()
-        if "choices" not in data:
-            return
+    for line in result.split("\n"):
+        fact = line.strip(" -•*").strip()
+        if fact and len(fact) > 3 and fact not in user_facts[chat_id]:
+            user_facts[chat_id].append(fact)
+            print(f"📌 Факт [{chat_id}]: {fact}")
 
-        raw = data["choices"][0]["message"]["content"].strip()
-        if not raw or raw.lower() in ["нет", "нет фактов", "пусто", ""]:
-            return
-
-        for line in raw.split("\n"):
-            fact = line.strip(" -•*").strip()
-            if fact and len(fact) > 3 and fact not in user_facts[chat_id]:
-                user_facts[chat_id].append(fact)
-                print(f"📌 Факт [{chat_id}]: {fact}")
-
-        # Храним только последние 12 фактов
-        user_facts[chat_id] = user_facts[chat_id][-12:]
-        save_all()
-
-    except Exception as e:
-        print("Ошибка фактов:", e)
+    user_facts[chat_id] = user_facts[chat_id][-12:]
+    save_all()
 
 def split_messages(text: str) -> list:
     text = text.strip()
@@ -200,10 +237,9 @@ def split_messages(text: str) -> list:
     if len(sentences) <= 2:
         return [text]
 
-    result = []
-    current = ""
+    result, current = [], ""
     for s in sentences:
-        if len(current) + len(s) < 155:
+        if len(current) + len(s) < 150:
             current = (current + " " + s).strip()
         else:
             if current:
@@ -211,14 +247,11 @@ def split_messages(text: str) -> list:
             current = s
     if current:
         result.append(current)
-
     return result[:3]
 
 async def maybe_react(context, chat_id, message_id, connection_id):
-    """Иногда ставит реакцию (не на каждое сообщение)"""
-    if random.random() > 0.27:
+    if random.random() > 0.25:
         return
-
     try:
         emoji = random.choice(REACTIONS)
         await context.bot.set_message_reaction(
@@ -227,10 +260,9 @@ async def maybe_react(context, chat_id, message_id, connection_id):
             reaction=[ReactionTypeEmoji(emoji)],
             business_connection_id=connection_id
         )
-        print(f"🎭 Реакция: {emoji}")
+        print(f"🎭 {emoji}")
     except Exception as e:
-        # В Business режиме реакции могут быть ограничены
-        print(f"Реакция не поставилась: {e}")
+        print("Реакция:", e)
 
 async def text_to_voice(text: str, path: str):
     communicate = edge_tts.Communicate(text, VOICE)
@@ -240,6 +272,116 @@ def should_reply_with_voice(is_voice_input: bool, answer: str) -> bool:
     if not is_voice_input:
         return False
     return len(answer) < 180
+
+def build_system_prompt(chat_id: str, mood: str) -> str:
+    prompt = BASE_PROMPT
+
+    # Роль
+    if settings.get("role"):
+        prompt += f"\n\nСейчас ты в роли: {settings['role']}"
+
+    # Настроение
+    mood_hints = {
+        "злой": "Человек раздражён или зол. Отвечай спокойно, коротко, без лишних шуток.",
+        "грустный": "Человек грустит. Будь мягче и теплее обычного.",
+        "весёлый": "Человек в хорошем настроении. Можно пошутить и быть легче.",
+        "усталый": "Человек устал. Отвечай коротко и по делу.",
+        "тревожный": "Человек волнуется. Будь спокойным и поддерживающим.",
+        "шутит": "Человек шутит. Можно ответить в том же тоне.",
+    }
+    if mood in mood_hints:
+        prompt += f"\n\n{mood_hints[mood]}"
+
+    # Факты
+    facts = user_facts.get(chat_id, [])
+    if facts:
+        prompt += "\n\nЧто ты знаешь об этом человеке:\n- " + "\n- ".join(facts[-8:])
+
+    return prompt
+
+async def handle_owner_commands(text: str, chat_id: str, context, connection_id) -> bool:
+    """Обработка команд владельца. Возвращает True, если команда обработана."""
+    text = text.strip().lower()
+
+    if text in ["/off", "выкл", "выключить"]:
+        settings["enabled"] = False
+        save_all()
+        await context.bot.send_message(
+            chat_id=int(chat_id),
+            text="бот выключен",
+            business_connection_id=connection_id,
+        )
+        return True
+
+    if text in ["/on", "вкл", "включить"]:
+        settings["enabled"] = True
+        save_all()
+        await context.bot.send_message(
+            chat_id=int(chat_id),
+            text="бот включен",
+            business_connection_id=connection_id,
+        )
+        return True
+
+    if text.startswith("/role ") or text.startswith("роль "):
+        role = text.split(" ", 1)[1].strip()
+        settings["role"] = role if role not in ["сброс", "off", "нет"] else None
+        save_all()
+        msg = f"роль: {settings['role']}" if settings["role"] else "роль сброшена"
+        await context.bot.send_message(
+            chat_id=int(chat_id),
+            text=msg,
+            business_connection_id=connection_id,
+        )
+        return True
+
+    if text in ["/summary", "саммари", "о чём говорили"]:
+        history = chat_histories.get(chat_id, [])
+        if not history:
+            await context.bot.send_message(
+                chat_id=int(chat_id),
+                text="пока не о чем вспоминать",
+                business_connection_id=connection_id,
+            )
+            return True
+
+        summary = await call_groq(
+            [
+                {
+                    "role": "system",
+                    "content": "Кратко саммаризируй диалог на русском в 2-4 предложениях. Пиши как человек."
+                },
+                {
+                    "role": "user",
+                    "content": "\n".join(
+                        f"{'Я' if m['role']=='assistant' else 'Он'}: {m['content']}"
+                        for m in history[-12:]
+                    )
+                }
+            ],
+            model="llama-3.1-8b-instant",
+            temperature=0.4,
+            max_tokens=200,
+        )
+        await context.bot.send_message(
+            chat_id=int(chat_id),
+            text=summary or "не смог вспомнить",
+            business_connection_id=connection_id,
+        )
+        return True
+
+    if text in ["/clear", "очистить", "забудь"]:
+        chat_histories[chat_id] = []
+        user_facts[chat_id] = []
+        save_all()
+        await context.bot.send_message(
+            chat_id=int(chat_id),
+            text="окей, всё забыл",
+            business_connection_id=connection_id,
+        )
+        return True
+
+    return False
 
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.business_message
@@ -255,21 +397,17 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if chat_id in BLACKLIST:
         return
 
-    # Команда очистки
-    if message.text and message.text.strip().lower() in ["/clear", "очистить", "забудь"]:
-        chat_histories[chat_id] = []
-        user_facts[chat_id] = []
-        save_all()
-        await context.bot.send_message(
-            chat_id=int(chat_id),
-            text="окей, всё забыл",
-            business_connection_id=connection_id,
-        )
+    # Бот выключен
+    if not settings.get("enabled", True):
         return
 
-    # Текст
+    # Текст / команды
     if message.text:
         user_text = message.text
+
+        # Команды (работают для всех, но особенно полезны тебе)
+        if await handle_owner_commands(user_text, chat_id, context, connection_id):
+            return
 
     # Голосовое
     elif message.voice:
@@ -283,7 +421,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if os.path.exists(path):
                 os.remove(path)
         except Exception as e:
-            print("Ошибка голосового:", e)
+            print(e)
             return
 
     # Фото
@@ -297,60 +435,39 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if os.path.exists(path):
                 os.remove(path)
         except Exception as e:
-            print("Ошибка фото:", e)
+            print(e)
             return
 
     if not user_text:
         return
 
-    print(f"📩 [{user_name}]: {user_text[:70]}")
+    print(f"📩 [{user_name}]: {user_text[:80]}")
 
-    # Реакция (иногда)
+    # Иногда не отвечаем
+    if not await should_reply(user_text):
+        print("🤫 Решил не отвечать")
+        await maybe_react(context, chat_id, message.message_id, connection_id)
+        return
+
+    # Реакция
     await maybe_react(context, chat_id, message.message_id, connection_id)
 
-    # Факты
+    # Факты + настроение
     await extract_facts(chat_id, user_text)
+    mood = await detect_mood(user_text)
+    print(f"😊 Настроение: {mood}")
 
     # История
     chat_histories[chat_id].append({"role": "user", "content": user_text})
     if len(chat_histories[chat_id]) > MAX_HISTORY:
         chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY:]
 
-    # Факты в промпт
-    facts = user_facts.get(chat_id, [])
-    facts_text = ""
-    if facts:
-        facts_text = "\n\nЧто ты знаешь об этом человеке:\n- " + "\n- ".join(facts[-8:])
+    system_prompt = build_system_prompt(chat_id, mood)
+    messages = [{"role": "system", "content": system_prompt}] + chat_histories[chat_id]
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT + facts_text}
-    ] + chat_histories[chat_id]
-
-    # Генерация ответа
-    try:
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": messages,
-                "temperature": 0.88,
-                "max_tokens": 450,
-            },
-            timeout=40,
-        )
-        data = resp.json()
-        if "choices" in data and data["choices"]:
-            answer = data["choices"][0]["message"]["content"].strip()
-        else:
-            answer = "хм"
-            print("Ошибка API:", data)
-    except Exception as e:
-        answer = "сейчас туплю"
-        print("Ошибка запроса:", e)
+    answer = await call_groq(messages, temperature=0.88, max_tokens=450)
+    if not answer:
+        answer = "хм"
 
     chat_histories[chat_id].append({"role": "assistant", "content": answer})
     save_all()
@@ -376,7 +493,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             if os.path.exists(voice_path):
                 os.remove(voice_path)
-            print(f"🎤 Голосовой → {user_name}")
+            print(f"🎤 → {user_name}")
         else:
             parts = split_messages(answer)
             for i, part in enumerate(parts):
@@ -385,7 +502,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     action=ChatAction.TYPING,
                     business_connection_id=connection_id
                 )
-                await asyncio.sleep(0.6 + len(part) * 0.011)
+                await asyncio.sleep(0.55 + len(part) * 0.01)
                 await context.bot.send_message(
                     chat_id=int(chat_id),
                     text=part,
@@ -393,31 +510,19 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     reply_to_message_id=message.message_id if i == 0 else None,
                 )
                 if i < len(parts) - 1:
-                    await asyncio.sleep(0.75)
-            print(f"✅ Текст ({len(parts)} сообщ.) → {user_name}")
+                    await asyncio.sleep(0.7)
+            print(f"✅ {len(parts)} сообщ. → {user_name}")
 
     except Exception as e:
         print("Ошибка отправки:", e)
-        try:
-            await context.bot.send_message(
-                chat_id=int(chat_id),
-                text=answer,
-                business_connection_id=connection_id,
-            )
-        except:
-            pass
 
 def main():
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .request(request)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).request(request).build()
     app.add_handler(BusinessConnectionHandler(on_business_connection))
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
 
-    print("Бот запущен (факты + реакции + несколько сообщений)...")
+    print("Бот запущен (умные фичи + вау)...")
+    print(f"Статус: {'ВКЛ' if settings.get('enabled', True) else 'ВЫКЛ'}")
     app.run_polling(
         allowed_updates=["business_connection", "business_message"],
         drop_pending_updates=True
