@@ -21,9 +21,8 @@ from telegram.constants import ChatAction
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Имя бота (для упоминаний в группе)
 BOT_NAME = "мику"
-BOT_USERNAMES = ["@grooooooook_bot"]  # свой username бота без @ (можно несколько)
+BOT_USERNAMES = ["@grooooooook_bot"]  # свой username без @
 
 HISTORY_FILE = "history.json"
 FACTS_FILE = "facts.json"
@@ -31,16 +30,16 @@ BLACKLIST_FILE = "blacklist.json"
 SETTINGS_FILE = "settings.json"
 MAX_HISTORY = 18
 
-VOICE = "ru-RU-SvetlanaNeural"  # женский голос
+VOICE = "ru-RU-SvetlanaNeural"
 REACTIONS = ["❤️", "🔥", "😂", "👍", "😮", "👏", "💯", "😍"]
 
 request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0, pool_timeout=30.0)
 
 BASE_PROMPT = """Ты — Мику, милая аниме-тян.
 Общаешься мило, эмоционально и по-девчачьи, как персонаж из аниме.
-Используй лёгкий аниме-стиль: «ня», «кья», «уву», «хехе», «эхехе», «бака» (редко и по делу), тянущиеся гласные (нееет, дааа).
-Можно эмодзи, но не перебарщивай.
-Говори коротко, живо, как в переписке.
+Используй лёгкий аниме-стиль: «ня», «кья», «уву», «хехе», «эхехе», иногда «бака».
+Можно эмодзи, но не слишком много.
+Говори коротко и живо.
 Никогда не говори, что ты бот, ИИ или программа.
 Если знаешь факты о человеке — учитывай их естественно.
 Отвечай на русском.
@@ -91,7 +90,8 @@ def is_mentioned(text: str, bot_username: str = None) -> bool:
     return False
 
 def clean_mention(text: str) -> str:
-    """Убирает упоминание бота из текста"""
+    if not text:
+        return ""
     text = re.sub(r'@\w+', '', text, flags=re.IGNORECASE)
     text = re.sub(rf'\b{BOT_NAME}\b', '', text, flags=re.IGNORECASE)
     return text.strip(" ,.-!?")
@@ -99,7 +99,7 @@ def clean_mention(text: str) -> str:
 async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bc = update.business_connection
     if bc.is_enabled:
-        print(f"✅ Business подключен: {bc.user.first_name}")
+        print(f"✅ Business: {bc.user.first_name}")
     else:
         print("❌ Business отключен")
 
@@ -194,10 +194,7 @@ async def extract_facts(chat_id: str, text: str):
         [
             {
                 "role": "system",
-                "content": (
-                    "Извлеки явные факты о человеке. "
-                    "Если нет — пустая строка. Каждый факт с новой строки."
-                )
+                "content": "Извлеки явные факты о человеке. Если нет — пустая строка. Каждый факт с новой строки."
             },
             {"role": "user", "content": text}
         ],
@@ -294,7 +291,7 @@ def build_system_prompt(chat_id: str, mood: str) -> str:
     return prompt
 
 async def handle_commands(text: str, chat_id: str, context, connection_id=None) -> bool:
-    text_l = text.strip().lower()
+    text_l = (text or "").strip().lower()
     kwargs = {"chat_id": int(chat_id)}
     if connection_id:
         kwargs["business_connection_id"] = connection_id
@@ -467,38 +464,83 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    if not message or not message.text:
+    if not message:
         return
 
-    # Только группы/супергруппы
     if message.chat.type not in ["group", "supergroup"]:
         return
 
     chat_id = str(message.chat.id)
     user_name = message.from_user.first_name if message.from_user else "человек"
-    text = message.text
 
     if chat_id in BLACKLIST:
         return
 
-    # Отвечаем только если упомянули
-    bot_info = context.bot
-    bot_username = (await bot_info.get_me()).username if bot_info else None
-    if not is_mentioned(text, bot_username):
+    bot_me = await context.bot.get_me()
+    bot_username = bot_me.username
+    bot_id = bot_me.id
+
+    # Проверяем: упомянули ИЛИ ответили на сообщение бота
+    is_reply_to_bot = (
+        message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.id == bot_id
+    )
+
+    text_for_mention = message.text or message.caption or ""
+    mentioned = is_mentioned(text_for_mention, bot_username)
+
+    if not mentioned and not is_reply_to_bot:
         return
 
-    # Команды
-    if await handle_commands(text, chat_id, context):
+    # Команды (только из текста)
+    if message.text and await handle_commands(message.text, chat_id, context):
         return
 
-    user_text = clean_mention(text)
+    user_text = None
+    is_voice_input = False
+
+    # Текст
+    if message.text:
+        user_text = clean_mention(message.text) if mentioned else message.text
+        if not user_text:
+            user_text = "привет"
+
+    # Голосовое
+    elif message.voice:
+        is_voice_input = True
+        try:
+            f = await message.voice.get_file()
+            path = f"/tmp/{chat_id}_v.ogg"
+            await f.download_to_drive(path)
+            user_text = await transcribe_voice(path)
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            print("Группа голосовое:", e)
+            return
+
+    # Фото
+    elif message.photo:
+        try:
+            f = await message.photo[-1].get_file()
+            path = f"/tmp/{chat_id}_p.jpg"
+            await f.download_to_drive(path)
+            caption = clean_mention(message.caption) if message.caption else ""
+            user_text = await analyze_image(path, caption)
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            print("Группа фото:", e)
+            return
+
     if not user_text:
-        user_text = "привет"
+        return
 
     await process_message(
         context, chat_id, user_name, user_text,
         message.message_id, connection_id=None,
-        is_voice_input=False, is_group=True
+        is_voice_input=is_voice_input, is_group=True
     )
 
 def main():
@@ -506,9 +548,14 @@ def main():
 
     app.add_handler(BusinessConnectionHandler(on_business_connection))
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
-    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, on_group_message))
 
-    print("Мику запущена~")
+    # Группы: текст, фото, голосовые
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.VOICE) & filters.ChatType.GROUPS,
+        on_group_message
+    ))
+
+    print("Мику запущена~ (группы + фото + reply)")
     app.run_polling(
         allowed_updates=["business_connection", "business_message", "message"],
         drop_pending_updates=True
