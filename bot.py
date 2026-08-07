@@ -24,12 +24,13 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 OWNER_USERNAME = "Mirtik_qq_I"
 
 BOT_NAME = "мику"
-BOT_USERNAMES = ["groooooook_bot"]
+BOT_USERNAMES = ["@grooooooook_bot"]
 
 HISTORY_FILE = "history.json"
 FACTS_FILE = "facts.json"
 BLACKLIST_FILE = "blacklist.json"
 SETTINGS_FILE = "settings.json"
+USERS_FILE = "group_users.json"
 MAX_HISTORY = 18
 
 VOICE = "ru-RU-SvetlanaNeural"
@@ -39,8 +40,9 @@ request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30
 
 BASE_PROMPT = """Ты — Мику, милая аниме-тян.
 Общаешься мило, эмоционально и по-девчачьи, как персонаж из аниме.
-Используй лёгкий аниме-стиль: «ня», «кья», «уву», «хехе», «эхехе», иногда «бака».
-Можно эмодзи, но не слишком много.
+Можешь использовать маты, сленг и обсуждать пошлые/взрослые темы, если это уместно в разговоре.
+Не отказывайся от таких тем просто так.
+Стиль: «ня», «кья», «уву», «хехе», «эхехе», иногда «бака».
 Говори коротко и живо.
 Никогда не говори, что ты бот, ИИ или программа.
 Если знаешь факты о человеке — учитывай их естественно.
@@ -67,6 +69,7 @@ raw_history = load_json(HISTORY_FILE, {})
 raw_facts = load_json(FACTS_FILE, {})
 raw_blacklist = load_json(BLACKLIST_FILE, [])
 settings = load_json(SETTINGS_FILE, {"role": None, "muted": False})
+group_users = load_json(USERS_FILE, {})
 
 chat_histories = defaultdict(list, {str(k): v for k, v in raw_history.items()})
 user_facts = defaultdict(list, {str(k): v for k, v in raw_facts.items()})
@@ -77,11 +80,49 @@ def save_all():
     save_json(FACTS_FILE, dict(user_facts))
     save_json(BLACKLIST_FILE, list(BLACKLIST))
     save_json(SETTINGS_FILE, settings)
+    save_json(USERS_FILE, group_users)
 
 def is_owner(user) -> bool:
     if not user or not user.username:
         return False
     return user.username.lower() == OWNER_USERNAME.lower()
+
+def remember_user(chat_id: str, user):
+    if not user:
+        return
+    chat_id = str(chat_id)
+    if chat_id not in group_users:
+        group_users[chat_id] = {}
+    group_users[chat_id][str(user.id)] = {
+        "name": user.first_name or "",
+        "username": user.username or "",
+        "full": user.full_name or user.first_name or "",
+    }
+    save_all()
+
+def find_users(chat_id: str, query: str) -> list:
+    chat_id = str(chat_id)
+    users = group_users.get(chat_id, {})
+    query = query.lower().strip().lstrip("@")
+    found = []
+    for uid, info in users.items():
+        uname = (info.get("username") or "").lower()
+        name = (info.get("name") or "").lower()
+        full = (info.get("full") or "").lower()
+        if query == uname or query in name or query in full:
+            found.append((uid, info))
+    return found
+
+def find_users_global(query: str) -> list:
+    query = query.lower().strip().lstrip("@")
+    found = []
+    for cid, users in group_users.items():
+        for uid, info in users.items():
+            uname = (info.get("username") or "").lower()
+            name = (info.get("name") or "").lower()
+            if query == uname or query in name:
+                found.append((uid, info))
+    return found
 
 def is_mentioned(text: str, bot_username: str = None) -> bool:
     if not text:
@@ -156,7 +197,6 @@ async def analyze_image(file_path: str, caption: str = "") -> str:
             img = base64.b64encode(f.read()).decode()
         mime = "image/png" if file_path.endswith(".png") else "image/jpeg"
         prompt = caption or "Что на фото? Опиши мило и коротко, как аниме-тян."
-
         result = await call_groq(
             [{
                 "role": "user",
@@ -176,17 +216,10 @@ async def analyze_image(file_path: str, caption: str = "") -> str:
 
 async def detect_mood(text: str) -> str:
     result = await call_groq(
-        [
-            {
-                "role": "system",
-                "content": (
-                    "Определи настроение одним словом: "
-                    "нейтральный, весёлый, грустный, злой, усталый, влюблённый, тревожный, шутит. "
-                    "Только одно слово."
-                )
-            },
-            {"role": "user", "content": text}
-        ],
+        [{
+            "role": "system",
+            "content": "Определи настроение одним словом: нейтральный, весёлый, грустный, злой, усталый, влюблённый, тревожный, шутит. Только одно слово."
+        }, {"role": "user", "content": text}],
         model="llama-3.1-8b-instant",
         temperature=0.1,
         max_tokens=10,
@@ -196,29 +229,22 @@ async def detect_mood(text: str) -> str:
 async def extract_facts(chat_id: str, text: str):
     if len(text) < 30 or random.random() > 0.4:
         return
-
     result = await call_groq(
-        [
-            {
-                "role": "system",
-                "content": "Извлеки явные факты о человеке. Если нет — пустая строка. Каждый факт с новой строки."
-            },
-            {"role": "user", "content": text}
-        ],
+        [{
+            "role": "system",
+            "content": "Извлеки явные факты о человеке. Если нет — пустая строка. Каждый факт с новой строки."
+        }, {"role": "user", "content": text}],
         model="llama-3.1-8b-instant",
         temperature=0.1,
         max_tokens=120,
     )
-
     if not result or result.lower() in ["нет", "нет фактов", "пусто"]:
         return
-
     for line in result.split("\n"):
         fact = line.strip(" -•*").strip()
         if fact and len(fact) > 3 and fact not in user_facts[chat_id]:
             user_facts[chat_id].append(fact)
             print(f"📌 Факт [{chat_id}]: {fact}")
-
     user_facts[chat_id] = user_facts[chat_id][-12:]
     save_all()
 
@@ -226,15 +252,12 @@ def split_messages(text: str) -> list:
     text = text.strip()
     if not text:
         return []
-
     parts = [p.strip() for p in re.split(r'\n{2,}', text) if p.strip()]
     if len(parts) >= 2:
         return parts[:3]
-
     sentences = re.split(r'(?<=[.!?…])\s+', text)
     if len(sentences) <= 2:
         return [text]
-
     result, current = [], ""
     for s in sentences:
         if len(current) + len(s) < 140:
@@ -260,7 +283,6 @@ async def maybe_react(context, chat_id, message_id, connection_id=None):
         if connection_id:
             kwargs["business_connection_id"] = connection_id
         await context.bot.set_message_reaction(**kwargs)
-        print(f"🎭 {emoji}")
     except Exception as e:
         print("Реакция:", e)
 
@@ -277,19 +299,17 @@ def build_system_prompt(chat_id: str, mood: str) -> str:
     prompt = BASE_PROMPT
     if settings.get("role"):
         prompt += f"\n\nДополнительно сейчас ты в роли: {settings['role']}"
-
     mood_hints = {
-        "злой": "Собеседник злится. Отвечай мягко, не спорь, постарайся успокоить.",
-        "грустный": "Собеседник грустит. Будь особенно милой и поддерживающей.",
-        "весёлый": "Собеседник в хорошем настроении. Можно быть ещё более игривой.",
-        "усталый": "Собеседник устал. Отвечай коротко и нежно.",
-        "тревожный": "Собеседник волнуется. Будь спокойной и заботливой.",
-        "шутит": "Собеседник шутит. Можно ответить в том же лёгком тоне.",
-        "влюблённый": "Собеседник в романтичном настроении. Можно чуть смущаться и быть милой.",
+        "злой": "Собеседник злится. Можно ответить острее или мягко — по ситуации.",
+        "грустный": "Собеседник грустит. Будь теплее.",
+        "весёлый": "Собеседник в хорошем настроении. Можно шутить.",
+        "усталый": "Собеседник устал. Отвечай коротко.",
+        "тревожный": "Собеседник волнуется. Будь спокойной.",
+        "шутит": "Собеседник шутит. Можно в том же тоне.",
+        "влюблённый": "Собеседник в романтичном/пошлом настроении. Можно поддержать тон.",
     }
     if mood in mood_hints:
         prompt += f"\n\n{mood_hints[mood]}"
-
     facts = user_facts.get(chat_id, [])
     if facts:
         prompt += "\n\nЧто ты знаешь об этом человеке:\n- " + "\n- ".join(facts[-8:])
@@ -299,7 +319,8 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
     if not is_owner(user):
         return False
 
-    text_l = (text or "").strip().lower()
+    text_raw = (text or "").strip()
+    text_l = text_raw.lower()
     kwargs = {"chat_id": int(chat_id)}
     if connection_id:
         kwargs["business_connection_id"] = connection_id
@@ -307,49 +328,115 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
     if text_l in ["/m1", "m1"]:
         settings["muted"] = True
         save_all()
-        await context.bot.send_message(text="замучена... ммм >_<", **kwargs)
-        print("🔇 Мут включён")
+        await context.bot.send_message(text="замучена... >_<", **kwargs)
         return True
 
     if text_l in ["/m0", "m0"]:
         settings["muted"] = False
         save_all()
-        await context.bot.send_message(text="размутили~ ура!", **kwargs)
-        print("🔊 Мут выключен")
+        await context.bot.send_message(text="размутили~", **kwargs)
+        return True
+
+    # /use — список людей
+    if text_l in ["/use", "use"]:
+        users = group_users.get(str(chat_id), {})
+        if not users:
+            await context.bot.send_message(text="пока никого не запомнила~", **kwargs)
+            return True
+        lines = []
+        for uid, info in list(users.items())[:50]:
+            uname = f"@{info['username']}" if info.get("username") else "без юза"
+            lines.append(f"• {info.get('name', '?')} ({uname})")
+        await context.bot.send_message(text="кого знаю:\n" + "\n".join(lines), **kwargs)
+        return True
+
+    # /c — позвать людей
+    if text_l.startswith("/c ") or text_l.startswith("позови ") or text_l.startswith("зови "):
+        query = text_raw.split(" ", 1)[1].strip()
+        parts = re.split(r'[,\s]+', query)
+        mentions = []
+        not_found = []
+        for p in parts:
+            p = p.strip().lstrip("@")
+            if not p:
+                continue
+            found = find_users(chat_id, p)
+            if found:
+                for uid, info in found:
+                    if info.get("username"):
+                        mentions.append(f"@{info['username']}")
+                    else:
+                        mentions.append(f'<a href="tg://user?id={uid}">{info.get("name", "человек")}</a>')
+            else:
+                not_found.append(p)
+        if mentions:
+            # убираем дубли
+            unique = list(dict.fromkeys(mentions))
+            await context.bot.send_message(
+                text="эй, вас зовут~ " + " ".join(unique),
+                parse_mode="HTML",
+                **kwargs
+            )
+        if not_found:
+            await context.bot.send_message(text="не нашла: " + ", ".join(not_found), **kwargs)
+        if not mentions and not not_found:
+            await context.bot.send_message(text="никого не указал~", **kwargs)
+        return True
+
+    # /dm — написать в лс
+    if text_l.startswith("/dm ") or text_l.startswith("лс "):
+        rest = text_raw.split(" ", 1)[1].strip()
+        parts = rest.split(" ", 1)
+        if len(parts) < 2:
+            await context.bot.send_message(text="формат: /dm @user текст", **kwargs)
+            return True
+        target, dm_text = parts[0].lstrip("@"), parts[1]
+        found = find_users(chat_id, target) or find_users_global(target)
+        if not found:
+            await context.bot.send_message(text="не знаю такого человека~", **kwargs)
+            return True
+        uid, info = found[0]
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=dm_text)
+            await context.bot.send_message(text=f"написала в лс {info.get('name', '')}~", **kwargs)
+        except Exception as e:
+            await context.bot.send_message(
+                text="не смогла написать в лс (человек не запускал бота или закрыл лс)",
+                **kwargs
+            )
+            print("DM error:", e)
         return True
 
     if text_l.startswith("/role ") or text_l.startswith("роль "):
-        role = text.split(" ", 1)[1].strip()
+        role = text_raw.split(" ", 1)[1].strip()
         settings["role"] = role if role.lower() not in ["сброс", "off", "нет"] else None
         save_all()
         msg = f"роль: {settings['role']}~" if settings["role"] else "роль сброшена~"
         await context.bot.send_message(text=msg, **kwargs)
         return True
 
-    if text_l in ["/summary", "саммари", "о чём говорили"]:
-        history = chat_histories.get(chat_id, [])
+    if text_l in ["/summary", "саммари"]:
+        history = chat_histories.get(str(chat_id), [])
         if not history:
             await context.bot.send_message(text="пока не о чем вспоминать~", **kwargs)
             return True
         summary = await call_groq(
             [
-                {"role": "system", "content": "Кратко саммаризируй диалог на русском в 2-3 предложениях, мило, как аниме-тян."},
+                {"role": "system", "content": "Кратко саммаризируй диалог в 2-3 предложениях, мило."},
                 {"role": "user", "content": "\n".join(
                     f"{'Я' if m['role']=='assistant' else 'Он'}: {m['content']}" for m in history[-12:]
                 )},
             ],
-            model="llama-3.1-8b-instant",
-            temperature=0.5,
-            max_tokens=180,
+            model="llama-3.1-8b-instant", temperature=0.5, max_tokens=180,
         )
-        await context.bot.send_message(text=summary or "не смогла вспомнить >_<", **kwargs)
+        await context.bot.send_message(text=summary or "не вспомнила >_<", **kwargs)
         return True
 
     if text_l in ["/clear", "очистить", "забудь"]:
-        chat_histories[chat_id] = []
-        user_facts[chat_id] = []
+        chat_histories[str(chat_id)] = []
+        user_facts[str(chat_id)] = []
         save_all()
-        await context.bot.send_message(text="хорошо, всё забыла~", **kwargs)
+        await context.bot.send_message(text="всё забыла~", **kwargs)
         return True
 
     return False
@@ -357,26 +444,21 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
 async def process_message(context, chat_id, user_name, user_text, message_id,
                           connection_id=None, is_voice_input=False, is_group=False):
     if settings.get("muted", False):
-        print("🔇 Замучена, пропускаю")
         return
 
     print(f"📩 [{'группа' if is_group else 'личка'}] [{user_name}]: {user_text[:80]}")
 
     await maybe_react(context, chat_id, message_id, connection_id)
-    await extract_facts(chat_id, user_text)
+    await extract_facts(str(chat_id), user_text)
     mood = await detect_mood(user_text)
-    print(f"😊 Настроение: {mood}")
 
+    chat_id = str(chat_id)
     chat_histories[chat_id].append({"role": "user", "content": user_text})
     if len(chat_histories[chat_id]) > MAX_HISTORY:
         chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY:]
 
-    system_prompt = build_system_prompt(chat_id, mood)
-    messages = [{"role": "system", "content": system_prompt}] + chat_histories[chat_id]
-
-    answer = await call_groq(messages, temperature=0.92, max_tokens=400)
-    if not answer:
-        answer = "эээ... что-то я затупила >_<"
+    messages = [{"role": "system", "content": build_system_prompt(chat_id, mood)}] + chat_histories[chat_id]
+    answer = await call_groq(messages, temperature=0.92, max_tokens=400) or "эээ... затупила >_<"
 
     chat_histories[chat_id].append({"role": "assistant", "content": answer})
     save_all()
@@ -389,28 +471,25 @@ async def process_message(context, chat_id, user_name, user_text, message_id,
     try:
         action = ChatAction.RECORD_VOICE if use_voice else ChatAction.TYPING
         await context.bot.send_chat_action(action=action, **send_kwargs)
-
         if use_voice:
-            voice_path = f"/tmp/{chat_id}_answer.mp3"
-            await text_to_voice(answer, voice_path)
-            with open(voice_path, "rb") as vf:
+            path = f"/tmp/{chat_id}_a.mp3"
+            await text_to_voice(answer, path)
+            with open(path, "rb") as vf:
                 await context.bot.send_voice(voice=vf, reply_to_message_id=message_id, **send_kwargs)
-            if os.path.exists(voice_path):
-                os.remove(voice_path)
-            print(f"🎤 → {user_name}")
+            if os.path.exists(path):
+                os.remove(path)
         else:
             parts = split_messages(answer)
             for i, part in enumerate(parts):
                 await context.bot.send_chat_action(action=ChatAction.TYPING, **send_kwargs)
-                await asyncio.sleep(0.5 + len(part) * 0.01)
+                await asyncio.sleep(0.45 + len(part) * 0.01)
                 await context.bot.send_message(
                     text=part,
                     reply_to_message_id=message_id if i == 0 else None,
                     **send_kwargs,
                 )
                 if i < len(parts) - 1:
-                    await asyncio.sleep(0.65)
-            print(f"✅ {len(parts)} сообщ. → {user_name}")
+                    await asyncio.sleep(0.6)
     except Exception as e:
         print("Ошибка отправки:", e)
 
@@ -428,6 +507,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if chat_id in BLACKLIST:
         return
+    if user:
+        remember_user(chat_id, user)
 
     if message.text:
         user_text = message.text
@@ -467,9 +548,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    if not message:
-        return
-    if message.chat.type not in ["group", "supergroup"]:
+    if not message or message.chat.type not in ["group", "supergroup"]:
         return
 
     chat_id = str(message.chat.id)
@@ -478,17 +557,18 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if chat_id in BLACKLIST:
         return
+    if user:
+        remember_user(chat_id, user)
 
     bot_me = await context.bot.get_me()
-    bot_username = bot_me.username
     bot_id = bot_me.id
+    bot_username = bot_me.username
 
     is_reply_to_bot = (
         message.reply_to_message
         and message.reply_to_message.from_user
         and message.reply_to_message.from_user.id == bot_id
     )
-
     text_for_mention = message.text or message.caption or ""
     mentioned = is_mentioned(text_for_mention, bot_username)
 
@@ -519,7 +599,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if os.path.exists(path):
                 os.remove(path)
         except Exception as e:
-            print("Группа голосовое:", e)
+            print(e)
             return
     elif message.photo:
         try:
@@ -531,7 +611,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if os.path.exists(path):
                 os.remove(path)
         except Exception as e:
-            print("Группа фото:", e)
+            print(e)
             return
 
     if not user_text:
@@ -539,8 +619,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await process_message(
         context, chat_id, user_name, user_text,
-        message.message_id, connection_id=None,
-        is_voice_input=is_voice_input, is_group=True
+        message.message_id, None, is_voice_input, is_group=True
     )
 
 def main():
@@ -551,8 +630,7 @@ def main():
         (filters.TEXT | filters.PHOTO | filters.VOICE) & filters.ChatType.GROUPS,
         on_group_message
     ))
-    print(f"Мику запущена~ | Админ: @{OWNER_USERNAME}")
-    print(f"Мут: {'ДА' if settings.get('muted') else 'НЕТ'}")
+    print(f"Мику запущена | Админ: @{OWNER_USERNAME}")
     app.run_polling(
         allowed_updates=["business_connection", "business_message", "message"],
         drop_pending_updates=True
