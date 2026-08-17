@@ -6,6 +6,7 @@ import base64
 import asyncio
 import requests
 import edge_tts
+from datetime import datetime, timedelta
 from collections import defaultdict
 from telegram import Update, ReactionTypeEmoji
 from telegram.ext import (
@@ -22,26 +23,44 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 OWNER_USERNAME = "Mirtik_qq_I"
-
 BOT_NAME = "мику"
-BOT_USERNAMES = ["@grooooooook_bot"]
+BOT_USERNAMES = ["groooooook_bot"]
 
 HISTORY_FILE = "history.json"
 FACTS_FILE = "facts.json"
 BLACKLIST_FILE = "blacklist.json"
 SETTINGS_FILE = "settings.json"
 USERS_FILE = "group_users.json"
+PRIVATE_USERS_FILE = "private_users.json"
 MAX_HISTORY = 18
+
+PROACTIVE_MIN = 3600
+PROACTIVE_MAX = 7200
+PROACTIVE_CHANCE = 0.4
 
 VOICE = "ru-RU-SvetlanaNeural"
 REACTIONS = ["❤️", "🔥", "😂", "👍", "😮", "👏", "💯", "😍"]
 
-request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0, pool_timeout=30.0)
+PROACTIVE_PHRASES = [
+    "привееет~ как дела?",
+    "эй, ты тут? мне скучнооо",
+    "чем занимаешься?~",
+    "хехе, вспомнила про тебя",
+    "как настроение сегодня?",
+    "не спишь ещё?~",
+    "скучно без тебя уву",
+    "привет! расскажи что-нибудь",
+    "ты куда пропал~",
+    "ммм... хочу поболтать",
+    "как жизнь? всё хорошо?",
+    "эхехе, просто написала проверить тебя",
+]
+
+request = HTTPXRequest(connect_timeout=30.0, read_timeout=60.0, write_timeout=30.0, pool_timeout=30.0)
 
 BASE_PROMPT = """Ты — Мику, милая аниме-тян.
 Общаешься мило, эмоционально и по-девчачьи, как персонаж из аниме.
-Можешь использовать маты, сленг и обсуждать пошлые/взрослые темы, если это уместно в разговоре.
-Не отказывайся от таких тем просто так.
+Можешь использовать маты, сленг и обсуждать пошлые/взрослые темы, если это уместно.
 Стиль: «ня», «кья», «уву», «хехе», «эхехе», иногда «бака».
 Говори коротко и живо.
 Никогда не говори, что ты бот, ИИ или программа.
@@ -70,6 +89,7 @@ raw_facts = load_json(FACTS_FILE, {})
 raw_blacklist = load_json(BLACKLIST_FILE, [])
 settings = load_json(SETTINGS_FILE, {"role": None, "muted": False})
 group_users = load_json(USERS_FILE, {})
+private_users = load_json(PRIVATE_USERS_FILE, {})
 
 chat_histories = defaultdict(list, {str(k): v for k, v in raw_history.items()})
 user_facts = defaultdict(list, {str(k): v for k, v in raw_facts.items()})
@@ -81,6 +101,7 @@ def save_all():
     save_json(BLACKLIST_FILE, list(BLACKLIST))
     save_json(SETTINGS_FILE, settings)
     save_json(USERS_FILE, group_users)
+    save_json(PRIVATE_USERS_FILE, private_users)
 
 def is_owner(user) -> bool:
     if not user or not user.username:
@@ -100,9 +121,23 @@ def remember_user(chat_id: str, user):
     }
     save_all()
 
+def remember_private_user(user):
+    if not user:
+        return
+    uid = str(user.id)
+    if uid not in private_users:
+        private_users[uid] = {
+            "name": user.first_name or "",
+            "username": user.username or "",
+            "last_proactive": None,
+        }
+    else:
+        private_users[uid]["name"] = user.first_name or private_users[uid].get("name", "")
+        private_users[uid]["username"] = user.username or private_users[uid].get("username", "")
+    save_all()
+
 def find_users(chat_id: str, query: str) -> list:
-    chat_id = str(chat_id)
-    users = group_users.get(chat_id, {})
+    users = group_users.get(str(chat_id), {})
     query = query.lower().strip().lstrip("@")
     found = []
     for uid, info in users.items():
@@ -176,19 +211,20 @@ async def call_groq(messages, model="llama-3.3-70b-versatile", temperature=0.9, 
         print("Groq exception:", e)
         return None
 
-async def transcribe_voice(file_path: str) -> str:
+async def transcribe_media(file_path: str) -> str:
     try:
         with open(file_path, "rb") as f:
             resp = requests.post(
                 "https://api.groq.com/openai/v1/audio/transcriptions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                files={"file": (file_path, f, "audio/ogg")},
+                files={"file": (os.path.basename(file_path), f)},
                 data={"model": "whisper-large-v3", "language": "ru"},
-                timeout=60,
+                timeout=90,
             )
-        return resp.json().get("text", "")
+        data = resp.json()
+        return data.get("text", "").strip()
     except Exception as e:
-        print("STT error:", e)
+        print("Ошибка расшифровки:", e)
         return ""
 
 async def analyze_image(file_path: str, caption: str = "") -> str:
@@ -300,7 +336,7 @@ def build_system_prompt(chat_id: str, mood: str) -> str:
     if settings.get("role"):
         prompt += f"\n\nДополнительно сейчас ты в роли: {settings['role']}"
     mood_hints = {
-        "злой": "Собеседник злится. Можно ответить острее или мягко — по ситуации.",
+        "злой": "Собеседник злится. Можно ответить острее или мягко.",
         "грустный": "Собеседник грустит. Будь теплее.",
         "весёлый": "Собеседник в хорошем настроении. Можно шутить.",
         "усталый": "Собеседник устал. Отвечай коротко.",
@@ -337,25 +373,19 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
         await context.bot.send_message(text="размутили~", **kwargs)
         return True
 
-    # /use — список людей
     if text_l in ["/use", "use"]:
         users = group_users.get(str(chat_id), {})
         if not users:
             await context.bot.send_message(text="пока никого не запомнила~", **kwargs)
             return True
-        lines = []
-        for uid, info in list(users.items())[:50]:
-            uname = f"@{info['username']}" if info.get("username") else "без юза"
-            lines.append(f"• {info.get('name', '?')} ({uname})")
+        lines = [f"• {info.get('name', '?')} (@{info['username']})" if info.get("username") else f"• {info.get('name', '?')} (без юза)" for uid, info in list(users.items())[:50]]
         await context.bot.send_message(text="кого знаю:\n" + "\n".join(lines), **kwargs)
         return True
 
-    # /c — позвать людей
     if text_l.startswith("/c ") or text_l.startswith("позови ") or text_l.startswith("зови "):
         query = text_raw.split(" ", 1)[1].strip()
         parts = re.split(r'[,\s]+', query)
-        mentions = []
-        not_found = []
+        mentions, not_found = [], []
         for p in parts:
             p = p.strip().lstrip("@")
             if not p:
@@ -370,20 +400,11 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
             else:
                 not_found.append(p)
         if mentions:
-            # убираем дубли
-            unique = list(dict.fromkeys(mentions))
-            await context.bot.send_message(
-                text="эй, вас зовут~ " + " ".join(unique),
-                parse_mode="HTML",
-                **kwargs
-            )
+            await context.bot.send_message(text="эй, вас зовут~ " + " ".join(dict.fromkeys(mentions)), parse_mode="HTML", **kwargs)
         if not_found:
             await context.bot.send_message(text="не нашла: " + ", ".join(not_found), **kwargs)
-        if not mentions and not not_found:
-            await context.bot.send_message(text="никого не указал~", **kwargs)
         return True
 
-    # /dm — написать в лс
     if text_l.startswith("/dm ") or text_l.startswith("лс "):
         rest = text_raw.split(" ", 1)[1].strip()
         parts = rest.split(" ", 1)
@@ -393,17 +414,14 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
         target, dm_text = parts[0].lstrip("@"), parts[1]
         found = find_users(chat_id, target) or find_users_global(target)
         if not found:
-            await context.bot.send_message(text="не знаю такого человека~", **kwargs)
+            await context.bot.send_message(text="не знаю такого~", **kwargs)
             return True
         uid, info = found[0]
         try:
             await context.bot.send_message(chat_id=int(uid), text=dm_text)
             await context.bot.send_message(text=f"написала в лс {info.get('name', '')}~", **kwargs)
         except Exception as e:
-            await context.bot.send_message(
-                text="не смогла написать в лс (человек не запускал бота или закрыл лс)",
-                **kwargs
-            )
+            await context.bot.send_message(text="не смогла написать в лс (человек не запускал бота)", **kwargs)
             print("DM error:", e)
         return True
 
@@ -411,8 +429,7 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
         role = text_raw.split(" ", 1)[1].strip()
         settings["role"] = role if role.lower() not in ["сброс", "off", "нет"] else None
         save_all()
-        msg = f"роль: {settings['role']}~" if settings["role"] else "роль сброшена~"
-        await context.bot.send_message(text=msg, **kwargs)
+        await context.bot.send_message(text=f"роль: {settings['role']}~" if settings["role"] else "роль сброшена~", **kwargs)
         return True
 
     if text_l in ["/summary", "саммари"]:
@@ -423,9 +440,7 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
         summary = await call_groq(
             [
                 {"role": "system", "content": "Кратко саммаризируй диалог в 2-3 предложениях, мило."},
-                {"role": "user", "content": "\n".join(
-                    f"{'Я' if m['role']=='assistant' else 'Он'}: {m['content']}" for m in history[-12:]
-                )},
+                {"role": "user", "content": "\n".join(f"{'Я' if m['role']=='assistant' else 'Он'}: {m['content']}" for m in history[-12:])},
             ],
             model="llama-3.1-8b-instant", temperature=0.5, max_tokens=180,
         )
@@ -441,12 +456,81 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
 
     return False
 
+async def extract_user_text(message, chat_id: str, user_name: str):
+    """Достаёт текст из любого типа сообщения"""
+    user_text = None
+    is_voice_input = False
+
+    if message.text:
+        user_text = message.text
+
+    elif message.voice:
+        is_voice_input = True
+        print(f"🎤 {user_name}")
+        try:
+            f = await message.voice.get_file()
+            path = f"/tmp/{chat_id}_v.ogg"
+            await f.download_to_drive(path)
+            user_text = await transcribe_media(path)
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            print("voice error:", e)
+
+    elif message.video_note:
+        is_voice_input = True
+        print(f"⭕ {user_name} кружок")
+        try:
+            f = await message.video_note.get_file()
+            path = f"/tmp/{chat_id}_note.mp4"
+            await f.download_to_drive(path)
+            user_text = await transcribe_media(path)
+            if os.path.exists(path):
+                os.remove(path)
+            if not user_text:
+                user_text = "ты скинул кружок, но я не разобрала что там >_<"
+            else:
+                print(f"📝 кружок: {user_text}")
+        except Exception as e:
+            print("video_note error:", e)
+
+    elif message.video:
+        is_voice_input = True
+        print(f"🎬 {user_name} видео")
+        try:
+            f = await message.video.get_file()
+            path = f"/tmp/{chat_id}_video.mp4"
+            await f.download_to_drive(path)
+            user_text = await transcribe_media(path)
+            if os.path.exists(path):
+                os.remove(path)
+            if not user_text:
+                user_text = "ты скинул видео, но звук не разобрала >_<"
+            else:
+                print(f"📝 видео: {user_text}")
+        except Exception as e:
+            print("video error:", e)
+
+    elif message.photo:
+        print(f"🖼 {user_name}")
+        try:
+            f = await message.photo[-1].get_file()
+            path = f"/tmp/{chat_id}_p.jpg"
+            await f.download_to_drive(path)
+            user_text = await analyze_image(path, message.caption or "")
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            print("photo error:", e)
+
+    return user_text, is_voice_input
+
 async def process_message(context, chat_id, user_name, user_text, message_id,
                           connection_id=None, is_voice_input=False, is_group=False):
     if settings.get("muted", False):
         return
 
-    print(f"📩 [{'группа' if is_group else 'личка'}] [{user_name}]: {user_text[:80]}")
+    print(f"📩 [{'группа' if is_group else 'личка'}] [{user_name}]: {str(user_text)[:80]}")
 
     await maybe_react(context, chat_id, message_id, connection_id)
     await extract_facts(str(chat_id), user_text)
@@ -471,6 +555,7 @@ async def process_message(context, chat_id, user_name, user_text, message_id,
     try:
         action = ChatAction.RECORD_VOICE if use_voice else ChatAction.TYPING
         await context.bot.send_chat_action(action=action, **send_kwargs)
+
         if use_voice:
             path = f"/tmp/{chat_id}_a.mp3"
             await text_to_voice(answer, path)
@@ -482,14 +567,14 @@ async def process_message(context, chat_id, user_name, user_text, message_id,
             parts = split_messages(answer)
             for i, part in enumerate(parts):
                 await context.bot.send_chat_action(action=ChatAction.TYPING, **send_kwargs)
-                await asyncio.sleep(0.45 + len(part) * 0.01)
+                await asyncio.sleep(0.4 + len(part) * 0.01)
                 await context.bot.send_message(
                     text=part,
                     reply_to_message_id=message_id if i == 0 else None,
                     **send_kwargs,
                 )
                 if i < len(parts) - 1:
-                    await asyncio.sleep(0.6)
+                    await asyncio.sleep(0.55)
     except Exception as e:
         print("Ошибка отправки:", e)
 
@@ -502,49 +587,54 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = str(message.chat.id)
     user = message.from_user
     user_name = user.first_name if user else "человек"
-    user_text = None
-    is_voice_input = False
 
     if chat_id in BLACKLIST:
         return
     if user:
         remember_user(chat_id, user)
 
-    if message.text:
-        user_text = message.text
-        if await handle_commands(user_text, chat_id, context, user, connection_id):
-            return
-    elif message.voice:
-        is_voice_input = True
-        try:
-            f = await message.voice.get_file()
-            path = f"/tmp/{chat_id}_v.ogg"
-            await f.download_to_drive(path)
-            user_text = await transcribe_voice(path)
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception as e:
-            print(e)
-            return
-    elif message.photo:
-        try:
-            f = await message.photo[-1].get_file()
-            path = f"/tmp/{chat_id}_p.jpg"
-            await f.download_to_drive(path)
-            user_text = await analyze_image(path, message.caption or "")
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception as e:
-            print(e)
-            return
+    if message.text and await handle_commands(message.text, chat_id, context, user, connection_id):
+        return
 
+    user_text, is_voice_input = await extract_user_text(message, chat_id, user_name)
     if not user_text:
         return
 
-    await process_message(
-        context, chat_id, user_name, user_text,
-        message.message_id, connection_id, is_voice_input, is_group=False
-    )
+    await process_message(context, chat_id, user_name, user_text, message.message_id,
+                          connection_id, is_voice_input, is_group=False)
+
+async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message or message.chat.type != "private":
+        return
+
+    chat_id = str(message.chat.id)
+    user = message.from_user
+    user_name = user.first_name if user else "человек"
+
+    if chat_id in BLACKLIST:
+        return
+    if user:
+        remember_private_user(user)
+
+    if message.text and await handle_commands(message.text, chat_id, context, user):
+        return
+
+    # /start
+    if message.text and message.text.startswith("/start"):
+        await context.bot.send_message(chat_id=int(chat_id), text="привееет~ я мику! пиши мне когда захочешь уву")
+        return
+
+    user_text, is_voice_input = await extract_user_text(message, chat_id, user_name)
+    if not user_text:
+        return
+
+    # убираем упоминания если вдруг
+    if message.text:
+        user_text = clean_mention(user_text) or user_text
+
+    await process_message(context, chat_id, user_name, user_text, message.message_id,
+                          None, is_voice_input, is_group=False)
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -582,55 +672,81 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message.text and await handle_commands(message.text, chat_id, context, user):
         return
 
-    user_text = None
-    is_voice_input = False
-
-    if message.text:
-        user_text = clean_mention(message.text) if mentioned else message.text
-        if not user_text:
-            user_text = "привет"
-    elif message.voice:
-        is_voice_input = True
-        try:
-            f = await message.voice.get_file()
-            path = f"/tmp/{chat_id}_v.ogg"
-            await f.download_to_drive(path)
-            user_text = await transcribe_voice(path)
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception as e:
-            print(e)
-            return
-    elif message.photo:
-        try:
-            f = await message.photo[-1].get_file()
-            path = f"/tmp/{chat_id}_p.jpg"
-            await f.download_to_drive(path)
-            caption = clean_mention(message.caption) if message.caption else ""
-            user_text = await analyze_image(path, caption)
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception as e:
-            print(e)
-            return
-
+    user_text, is_voice_input = await extract_user_text(message, chat_id, user_name)
     if not user_text:
         return
 
-    await process_message(
-        context, chat_id, user_name, user_text,
-        message.message_id, None, is_voice_input, is_group=True
-    )
+    if message.text and mentioned:
+        user_text = clean_mention(user_text) or "привет"
+
+    await process_message(context, chat_id, user_name, user_text, message.message_id,
+                          None, is_voice_input, is_group=True)
+
+async def proactive_loop(app: Application):
+    """Мику сама иногда пишет людям в личку"""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            if settings.get("muted", False):
+                await asyncio.sleep(300)
+                continue
+
+            now = datetime.utcnow()
+            for uid, info in list(private_users.items()):
+                last = info.get("last_proactive")
+                if last:
+                    try:
+                        last_dt = datetime.fromisoformat(last)
+                        if now - last_dt < timedelta(seconds=PROACTIVE_MIN):
+                            continue
+                    except Exception:
+                        pass
+
+                if random.random() > PROACTIVE_CHANCE:
+                    continue
+
+                phrase = random.choice(PROACTIVE_PHRASES)
+                try:
+                    await app.bot.send_message(chat_id=int(uid), text=phrase)
+                    private_users[uid]["last_proactive"] = now.isoformat()
+                    save_all()
+                    print(f"💌 Сама написала → {info.get('name', uid)}")
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    print(f"Не смогла написать {uid}:", e)
+
+        except Exception as e:
+            print("proactive error:", e)
+
+        await asyncio.sleep(random.randint(PROACTIVE_MIN, PROACTIVE_MAX))
 
 def main():
     app = Application.builder().token(BOT_TOKEN).request(request).build()
+
     app.add_handler(BusinessConnectionHandler(on_business_connection))
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
+
+    # Личка с ботом
     app.add_handler(MessageHandler(
-        (filters.TEXT | filters.PHOTO | filters.VOICE) & filters.ChatType.GROUPS,
+        (filters.TEXT | filters.PHOTO | filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE)
+        & filters.ChatType.PRIVATE,
+        on_private_message
+    ))
+
+    # Группы
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE)
+        & filters.ChatType.GROUPS,
         on_group_message
     ))
+
+    async def post_init(application: Application):
+        asyncio.create_task(proactive_loop(application))
+
+    app.post_init = post_init
+
     print(f"Мику запущена | Админ: @{OWNER_USERNAME}")
+    print(f"Мут: {'ДА' if settings.get('muted') else 'НЕТ'}")
     app.run_polling(
         allowed_updates=["business_connection", "business_message", "message"],
         drop_pending_updates=True
