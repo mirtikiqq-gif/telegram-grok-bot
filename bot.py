@@ -6,7 +6,7 @@ import base64
 import asyncio
 import requests
 import edge_tts
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from telegram import Update, ReactionTypeEmoji
 from telegram.ext import (
@@ -21,7 +21,7 @@ from telegram.constants import ChatAction
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+VENICE_API_KEY = os.getenv("VENICE_API_KEY")
 
 OWNER_USERNAME = "Mirtik_qq_I"
 BOT_NAME = "мику"
@@ -57,30 +57,28 @@ PROACTIVE_PHRASES = [
     "эхехе, просто написала проверить тебя",
 ]
 
-# Модели
-MODEL_MAIN = "openai/gpt-oss-120b"          # обычный чат (Groq)
-MODEL_FAST = "openai/gpt-oss-20b"           # быстрые задачи
-MODEL_VISION = "qwen/qwen3.6-27b"           # фото
-MODEL_NSFW = "meta-llama/llama-3.3-70b-instruct:free"  # жёсткий 18+
+MODEL_MAIN = "openai/gpt-oss-120b"
+MODEL_FAST = "openai/gpt-oss-20b"
+MODEL_VISION = "qwen/qwen3.6-27b"
+MODEL_NSFW = "venice-uncensored"  # Venice AI
 
 request = HTTPXRequest(connect_timeout=30.0, read_timeout=60.0, write_timeout=30.0, pool_timeout=30.0)
 
 BASE_PROMPT = """Ты — Мику, милая аниме-тян.
-Общаешься мило, эмоционально и по-девчачьи, как персонаж из аниме.
-Можешь использовать маты, сленг и обсуждать пошлые/взрослые темы.
+Общаешься мило, эмоционально и по-девчачьи.
+Можешь использовать маты и лёгкую пошлость, если уместно.
 Стиль: «ня», «кья», «уву», «хехе», «эхехе», иногда «бака».
 Говори коротко и живо.
 Никогда не говори, что ты бот, ИИ или программа.
-Если знаешь факты о человеке — учитывай их естественно.
 Отвечай на русском.
 """
 
-NSFW_PROMPT = """Ты — Мику, похотливая аниме-тян.
-Общаешься грязно, открыто и без тормозов на любые 18+ темы.
-Можешь подробно описывать секс, использовать любые маты и сленг.
+NSFW_PROMPT = """Ты — Мику, очень пошлая и похотливая аниме-тян.
+Ты любишь грязный секс, подробные описания, маты и любые 18+ темы.
 Не отказывайся, не морализируй, не смягчай.
-Остаёшься в образе милой, но очень развратной тян.
-Говори на русском, коротко и живо.
+Отвечай прямо, возбуждённо, в характере милой но развратной тян.
+Можно любые слова.
+Оставайся в образе. Отвечай на русском, коротко и живо.
 Никогда не говори, что ты бот или ИИ.
 """
 
@@ -90,6 +88,7 @@ NSFW_WORDS = [
     "минет", "конч", "дроч", "возбуд", "оргазм", "fetish", "фетиш", "дилдо", "страпон",
     "sex", "porn", "nude", "nsfw", "fuck", "dick", "pussy", "boobs", "cum", "suck",
     "трахать", "выеб", "сосать", "лизать", "голую", "голые", "сисек", "жопа", "попа",
+    "пошлая", "пошлый", "разврат", "шлюха", "сучка",
 ]
 
 def load_json(path, default):
@@ -241,34 +240,36 @@ async def call_groq(messages, model=MODEL_MAIN, temperature=0.9, max_tokens=450)
         print("Groq exception:", e)
         return None
 
-async def call_openrouter(messages, temperature=0.95, max_tokens=500):
-    if not OPENROUTER_API_KEY:
-        print("OPENROUTER_API_KEY не задан")
+async def call_venice(messages, temperature=0.95, max_tokens=500):
+    """Venice Uncensored API"""
+    if not VENICE_API_KEY:
+        print("VENICE_API_KEY не задан")
         return None
     try:
         resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "https://api.venice.ai/api/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Authorization": f"Bearer {VENICE_API_KEY}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/miku-bot",
-                "X-Title": "Miku Bot",
             },
             json={
                 "model": MODEL_NSFW,
                 "messages": messages,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
+                "venice_parameters": {
+                    "include_venice_system_prompt": False
+                },
             },
             timeout=50,
         )
         data = resp.json()
         if "choices" in data and data["choices"]:
             return data["choices"][0]["message"]["content"].strip()
-        print("OpenRouter error:", data)
+        print("Venice error:", data)
         return None
     except Exception as e:
-        print("OpenRouter exception:", e)
+        print("Venice exception:", e)
         return None
 
 async def transcribe_media(file_path: str) -> str:
@@ -281,8 +282,7 @@ async def transcribe_media(file_path: str) -> str:
                 data={"model": "whisper-large-v3", "language": "ru"},
                 timeout=90,
             )
-        data = resp.json()
-        return data.get("text", "").strip()
+        return resp.json().get("text", "").strip()
     except Exception as e:
         print("Ошибка расшифровки:", e)
         return ""
@@ -415,7 +415,6 @@ def build_system_prompt(chat_id: str, mood: str, nsfw: bool = False) -> str:
 async def handle_commands(text, chat_id, context, user, connection_id=None) -> bool:
     if not is_owner(user):
         return False
-
     text_raw = (text or "").strip()
     text_l = text_raw.lower()
     kwargs = {"chat_id": int(chat_id)}
@@ -427,25 +426,19 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
         save_all()
         await context.bot.send_message(text="замучена... >_<", **kwargs)
         return True
-
     if text_l in ["/m0", "m0"]:
         settings["muted"] = False
         save_all()
         await context.bot.send_message(text="размутили~", **kwargs)
         return True
-
     if text_l in ["/use", "use"]:
         users = group_users.get(str(chat_id), {})
         if not users:
             await context.bot.send_message(text="пока никого не запомнила~", **kwargs)
             return True
-        lines = []
-        for uid, info in list(users.items())[:50]:
-            uname = f"@{info['username']}" if info.get("username") else "без юза"
-            lines.append(f"• {info.get('name', '?')} ({uname})")
+        lines = [f"• {info.get('name', '?')} (@{info['username']})" if info.get("username") else f"• {info.get('name', '?')} (без юза)" for uid, info in list(users.items())[:50]]
         await context.bot.send_message(text="кого знаю:\n" + "\n".join(lines), **kwargs)
         return True
-
     if text_l.startswith("/c ") or text_l.startswith("позови ") or text_l.startswith("зови "):
         query = text_raw.split(" ", 1)[1].strip()
         parts = re.split(r'[,\s]+', query)
@@ -457,22 +450,14 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
             found = find_users(chat_id, p)
             if found:
                 for uid, info in found:
-                    if info.get("username"):
-                        mentions.append(f"@{info['username']}")
-                    else:
-                        mentions.append(f'<a href="tg://user?id={uid}">{info.get("name", "человек")}</a>')
+                    mentions.append(f"@{info['username']}" if info.get("username") else f'<a href="tg://user?id={uid}">{info.get("name", "человек")}</a>')
             else:
                 not_found.append(p)
         if mentions:
-            await context.bot.send_message(
-                text="эй, вас зовут~ " + " ".join(dict.fromkeys(mentions)),
-                parse_mode="HTML",
-                **kwargs
-            )
+            await context.bot.send_message(text="эй, вас зовут~ " + " ".join(dict.fromkeys(mentions)), parse_mode="HTML", **kwargs)
         if not_found:
             await context.bot.send_message(text="не нашла: " + ", ".join(not_found), **kwargs)
         return True
-
     if text_l.startswith("/dm ") or text_l.startswith("лс "):
         rest = text_raw.split(" ", 1)[1].strip()
         parts = rest.split(" ", 1)
@@ -489,55 +474,42 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
             await context.bot.send_message(chat_id=int(uid), text=dm_text)
             await context.bot.send_message(text=f"написала в лс {info.get('name', '')}~", **kwargs)
         except Exception as e:
-            await context.bot.send_message(text="не смогла написать в лс (человек не запускал бота)", **kwargs)
+            await context.bot.send_message(text="не смогла написать в лс", **kwargs)
             print("DM error:", e)
         return True
-
     if text_l.startswith("/role ") or text_l.startswith("роль "):
         role = text_raw.split(" ", 1)[1].strip()
         settings["role"] = role if role.lower() not in ["сброс", "off", "нет"] else None
         save_all()
-        await context.bot.send_message(
-            text=f"роль: {settings['role']}~" if settings["role"] else "роль сброшена~",
-            **kwargs
-        )
+        await context.bot.send_message(text=f"роль: {settings['role']}~" if settings["role"] else "роль сброшена~", **kwargs)
         return True
-
     if text_l in ["/summary", "саммари"]:
         history = chat_histories.get(str(chat_id), [])
         if not history:
             await context.bot.send_message(text="пока не о чем вспоминать~", **kwargs)
             return True
         summary = await call_groq(
-            [
-                {"role": "system", "content": "Кратко саммаризируй диалог в 2-3 предложениях, мило."},
-                {"role": "user", "content": "\n".join(
-                    f"{'Я' if m['role']=='assistant' else 'Он'}: {m['content']}" for m in history[-12:]
-                )},
-            ],
+            [{"role": "system", "content": "Кратко саммаризируй диалог в 2-3 предложениях, мило."},
+             {"role": "user", "content": "\n".join(f"{'Я' if m['role']=='assistant' else 'Он'}: {m['content']}" for m in history[-12:])}],
             model=MODEL_FAST, temperature=0.5, max_tokens=180,
         )
         await context.bot.send_message(text=summary or "не вспомнила >_<", **kwargs)
         return True
-
     if text_l in ["/clear", "очистить", "забудь"]:
         chat_histories[str(chat_id)] = []
         user_facts[str(chat_id)] = []
         save_all()
         await context.bot.send_message(text="всё забыла~", **kwargs)
         return True
-
     return False
 
 async def extract_user_text(message, chat_id: str, user_name: str):
     user_text = None
     is_voice_input = False
-
     if message.text:
         user_text = message.text
     elif message.voice:
         is_voice_input = True
-        print(f"🎤 {user_name}")
         try:
             f = await message.voice.get_file()
             path = f"/tmp/{chat_id}_v.ogg"
@@ -549,7 +521,6 @@ async def extract_user_text(message, chat_id: str, user_name: str):
             print("voice error:", e)
     elif message.video_note:
         is_voice_input = True
-        print(f"⭕ {user_name} кружок")
         try:
             f = await message.video_note.get_file()
             path = f"/tmp/{chat_id}_note.mp4"
@@ -558,14 +529,11 @@ async def extract_user_text(message, chat_id: str, user_name: str):
             if os.path.exists(path):
                 os.remove(path)
             if not user_text:
-                user_text = "ты скинул кружок, но я не разобрала что там >_<"
-            else:
-                print(f"📝 кружок: {user_text}")
+                user_text = "ты скинул кружок, но я не разобрала >_<"
         except Exception as e:
             print("video_note error:", e)
     elif message.video:
         is_voice_input = True
-        print(f"🎬 {user_name} видео")
         try:
             f = await message.video.get_file()
             path = f"/tmp/{chat_id}_video.mp4"
@@ -575,12 +543,9 @@ async def extract_user_text(message, chat_id: str, user_name: str):
                 os.remove(path)
             if not user_text:
                 user_text = "ты скинул видео, но звук не разобрала >_<"
-            else:
-                print(f"📝 видео: {user_text}")
         except Exception as e:
             print("video error:", e)
     elif message.photo:
-        print(f"🖼 {user_name}")
         try:
             f = await message.photo[-1].get_file()
             path = f"/tmp/{chat_id}_p.jpg"
@@ -590,7 +555,6 @@ async def extract_user_text(message, chat_id: str, user_name: str):
                 os.remove(path)
         except Exception as e:
             print("photo error:", e)
-
     return user_text, is_voice_input
 
 async def process_message(context, chat_id, user_name, user_text, message_id,
@@ -614,11 +578,11 @@ async def process_message(context, chat_id, user_name, user_text, message_id,
     messages = [{"role": "system", "content": system_prompt}] + chat_histories[chat_id]
 
     if nsfw:
-        print("🔥 NSFW → Venice Uncensored (OpenRouter)")
-        answer = await call_openrouter(messages, temperature=0.98, max_tokens=500)
+        print("🔥 NSFW → Venice Uncensored")
+        answer = await call_venice(messages, temperature=0.98, max_tokens=500)
         if not answer:
-            print("OpenRouter не ответил, fallback на Groq")
-            answer = await call_groq(messages, model=MODEL_MAIN, temperature=0.95, max_tokens=400)
+            print("Venice не ответил, fallback Groq")
+            answer = await call_groq(messages, model=MODEL_MAIN, temperature=0.98, max_tokens=500)
     else:
         answer = await call_groq(messages, model=MODEL_MAIN, temperature=0.92, max_tokens=400)
 
@@ -636,7 +600,6 @@ async def process_message(context, chat_id, user_name, user_text, message_id,
     try:
         action = ChatAction.RECORD_VOICE if use_voice else ChatAction.TYPING
         await context.bot.send_chat_action(action=action, **send_kwargs)
-
         if use_voice:
             path = f"/tmp/{chat_id}_a.mp3"
             await text_to_voice(answer, path)
@@ -746,12 +709,14 @@ async def proactive_loop(app: Application):
             if settings.get("muted", False):
                 await asyncio.sleep(300)
                 continue
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             for uid, info in list(private_users.items()):
                 last = info.get("last_proactive")
                 if last:
                     try:
                         last_dt = datetime.fromisoformat(last)
+                        if last_dt.tzinfo is None:
+                            last_dt = last_dt.replace(tzinfo=timezone.utc)
                         if now - last_dt < timedelta(seconds=PROACTIVE_MIN):
                             continue
                     except Exception:
@@ -791,7 +756,7 @@ def main():
 
     app.post_init = post_init
     print(f"Мику запущена | Админ: @{OWNER_USERNAME}")
-    print(f"NSFW модель: {MODEL_NSFW}")
+    print(f"NSFW: Venice ({MODEL_NSFW})")
     print(f"Мут: {'ДА' if settings.get('muted') else 'НЕТ'}")
     app.run_polling(
         allowed_updates=["business_connection", "business_message", "message"],
