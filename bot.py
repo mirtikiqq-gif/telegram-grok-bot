@@ -21,6 +21,7 @@ from telegram.constants import ChatAction
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 OWNER_USERNAME = "Mirtik_qq_I"
 BOT_NAME = "мику"
@@ -56,22 +57,40 @@ PROACTIVE_PHRASES = [
     "эхехе, просто написала проверить тебя",
 ]
 
-# Актуальные модели Groq (после 16.08.2026)
-MODEL_MAIN = "openai/gpt-oss-120b"
-MODEL_FAST = "openai/gpt-oss-20b"
-MODEL_VISION = "qwen/qwen3.6-27b"
+# Модели
+MODEL_MAIN = "openai/gpt-oss-120b"          # обычный чат (Groq)
+MODEL_FAST = "openai/gpt-oss-20b"           # быстрые задачи
+MODEL_VISION = "qwen/qwen3.6-27b"           # фото
+MODEL_NSFW = "cognitivecomputations/dolphin-mistral-24b-venice-edition:free"  # жёсткий 18+
 
 request = HTTPXRequest(connect_timeout=30.0, read_timeout=60.0, write_timeout=30.0, pool_timeout=30.0)
 
 BASE_PROMPT = """Ты — Мику, милая аниме-тян.
 Общаешься мило, эмоционально и по-девчачьи, как персонаж из аниме.
-Можешь использовать маты, сленг и обсуждать пошлые/взрослые темы, если это уместно.
+Можешь использовать маты, сленг и обсуждать пошлые/взрослые темы.
 Стиль: «ня», «кья», «уву», «хехе», «эхехе», иногда «бака».
 Говори коротко и живо.
 Никогда не говори, что ты бот, ИИ или программа.
 Если знаешь факты о человеке — учитывай их естественно.
 Отвечай на русском.
 """
+
+NSFW_PROMPT = """Ты — Мику, похотливая аниме-тян.
+Общаешься грязно, открыто и без тормозов на любые 18+ темы.
+Можешь подробно описывать секс, использовать любые маты и сленг.
+Не отказывайся, не морализируй, не смягчай.
+Остаёшься в образе милой, но очень развратной тян.
+Говори на русском, коротко и живо.
+Никогда не говори, что ты бот или ИИ.
+"""
+
+NSFW_WORDS = [
+    "секс", "трах", "ебать", "ебал", "еба", "член", "хуй", "писька", "пизд", "сиськи",
+    "грудь", "голая", "голый", "эротик", "порн", "пошл", "интим", "оральн", "анал",
+    "минет", "конч", "дроч", "возбуд", "оргазм", "fetish", "фетиш", "дилдо", "страпон",
+    "sex", "porn", "nude", "nsfw", "fuck", "dick", "pussy", "boobs", "cum", "suck",
+    "трахать", "выеб", "сосать", "лизать", "голую", "голые", "сисек", "жопа", "попа",
+]
 
 def load_json(path, default):
     try:
@@ -112,6 +131,12 @@ def is_owner(user) -> bool:
     if not user or not user.username:
         return False
     return user.username.lower() == OWNER_USERNAME.lower()
+
+def is_nsfw(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(w in t for w in NSFW_WORDS)
 
 def remember_user(chat_id: str, user):
     if not user:
@@ -214,6 +239,36 @@ async def call_groq(messages, model=MODEL_MAIN, temperature=0.9, max_tokens=450)
         return None
     except Exception as e:
         print("Groq exception:", e)
+        return None
+
+async def call_openrouter(messages, temperature=0.95, max_tokens=500):
+    if not OPENROUTER_API_KEY:
+        print("OPENROUTER_API_KEY не задан")
+        return None
+    try:
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/miku-bot",
+                "X-Title": "Miku Bot",
+            },
+            json={
+                "model": MODEL_NSFW,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            },
+            timeout=50,
+        )
+        data = resp.json()
+        if "choices" in data and data["choices"]:
+            return data["choices"][0]["message"]["content"].strip()
+        print("OpenRouter error:", data)
+        return None
+    except Exception as e:
+        print("OpenRouter exception:", e)
         return None
 
 async def transcribe_media(file_path: str) -> str:
@@ -324,8 +379,7 @@ async def maybe_react(context, chat_id, message_id, connection_id=None):
         if connection_id:
             kwargs["business_connection_id"] = connection_id
         await context.bot.set_message_reaction(**kwargs)
-    except Exception as e:
-        # Реакции в business иногда не работают — не страшно
+    except Exception:
         pass
 
 async def text_to_voice(text: str, path: str):
@@ -337,21 +391,22 @@ def should_reply_with_voice(is_voice_input: bool, answer: str) -> bool:
         return False
     return len(answer) < 160
 
-def build_system_prompt(chat_id: str, mood: str) -> str:
-    prompt = BASE_PROMPT
+def build_system_prompt(chat_id: str, mood: str, nsfw: bool = False) -> str:
+    prompt = NSFW_PROMPT if nsfw else BASE_PROMPT
     if settings.get("role"):
         prompt += f"\n\nДополнительно сейчас ты в роли: {settings['role']}"
-    mood_hints = {
-        "злой": "Собеседник злится. Можно ответить острее или мягко.",
-        "грустный": "Собеседник грустит. Будь теплее.",
-        "весёлый": "Собеседник в хорошем настроении. Можно шутить.",
-        "усталый": "Собеседник устал. Отвечай коротко.",
-        "тревожный": "Собеседник волнуется. Будь спокойной.",
-        "шутит": "Собеседник шутит. Можно в том же тоне.",
-        "влюблённый": "Собеседник в романтичном/пошлом настроении. Можно поддержать тон.",
-    }
-    if mood in mood_hints:
-        prompt += f"\n\n{mood_hints[mood]}"
+    if not nsfw:
+        mood_hints = {
+            "злой": "Собеседник злится. Можно ответить острее или мягко.",
+            "грустный": "Собеседник грустит. Будь теплее.",
+            "весёлый": "Собеседник в хорошем настроении. Можно шутить.",
+            "усталый": "Собеседник устал. Отвечай коротко.",
+            "тревожный": "Собеседник волнуется. Будь спокойной.",
+            "шутит": "Собеседник шутит. Можно в том же тоне.",
+            "влюблённый": "Собеседник в романтичном/пошлом настроении. Можно поддержать тон.",
+        }
+        if mood in mood_hints:
+            prompt += f"\n\n{mood_hints[mood]}"
     facts = user_facts.get(chat_id, [])
     if facts:
         prompt += "\n\nЧто ты знаешь об этом человеке:\n- " + "\n- ".join(facts[-8:])
@@ -480,7 +535,6 @@ async def extract_user_text(message, chat_id: str, user_name: str):
 
     if message.text:
         user_text = message.text
-
     elif message.voice:
         is_voice_input = True
         print(f"🎤 {user_name}")
@@ -493,7 +547,6 @@ async def extract_user_text(message, chat_id: str, user_name: str):
                 os.remove(path)
         except Exception as e:
             print("voice error:", e)
-
     elif message.video_note:
         is_voice_input = True
         print(f"⭕ {user_name} кружок")
@@ -510,7 +563,6 @@ async def extract_user_text(message, chat_id: str, user_name: str):
                 print(f"📝 кружок: {user_text}")
         except Exception as e:
             print("video_note error:", e)
-
     elif message.video:
         is_voice_input = True
         print(f"🎬 {user_name} видео")
@@ -527,7 +579,6 @@ async def extract_user_text(message, chat_id: str, user_name: str):
                 print(f"📝 видео: {user_text}")
         except Exception as e:
             print("video error:", e)
-
     elif message.photo:
         print(f"🖼 {user_name}")
         try:
@@ -558,8 +609,21 @@ async def process_message(context, chat_id, user_name, user_text, message_id,
     if len(chat_histories[chat_id]) > MAX_HISTORY:
         chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY:]
 
-    messages = [{"role": "system", "content": build_system_prompt(chat_id, mood)}] + chat_histories[chat_id]
-    answer = await call_groq(messages, model=MODEL_MAIN, temperature=0.92, max_tokens=400) or "эээ... затупила >_<"
+    nsfw = is_nsfw(user_text)
+    system_prompt = build_system_prompt(chat_id, mood, nsfw=nsfw)
+    messages = [{"role": "system", "content": system_prompt}] + chat_histories[chat_id]
+
+    if nsfw:
+        print("🔥 NSFW → Venice Uncensored (OpenRouter)")
+        answer = await call_openrouter(messages, temperature=0.98, max_tokens=500)
+        if not answer:
+            print("OpenRouter не ответил, fallback на Groq")
+            answer = await call_groq(messages, model=MODEL_MAIN, temperature=0.95, max_tokens=400)
+    else:
+        answer = await call_groq(messages, model=MODEL_MAIN, temperature=0.92, max_tokens=400)
+
+    if not answer:
+        answer = "эээ... затупила >_<"
 
     chat_histories[chat_id].append({"role": "assistant", "content": answer})
     save_all()
@@ -599,24 +663,19 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.business_message
     if not message:
         return
-
     connection_id = message.business_connection_id
     chat_id = str(message.chat.id)
     user = message.from_user
     user_name = user.first_name if user else "человек"
-
     if chat_id in BLACKLIST:
         return
     if user:
         remember_user(chat_id, user)
-
     if message.text and await handle_commands(message.text, chat_id, context, user, connection_id):
         return
-
     user_text, is_voice_input = await extract_user_text(message, chat_id, user_name)
     if not user_text:
         return
-
     await process_message(context, chat_id, user_name, user_text, message.message_id,
                           connection_id, is_voice_input, is_group=False)
 
@@ -624,30 +683,23 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     message = update.message
     if not message or message.chat.type != "private":
         return
-
     chat_id = str(message.chat.id)
     user = message.from_user
     user_name = user.first_name if user else "человек"
-
     if chat_id in BLACKLIST:
         return
     if user:
         remember_private_user(user)
-
     if message.text and await handle_commands(message.text, chat_id, context, user):
         return
-
     if message.text and message.text.startswith("/start"):
         await context.bot.send_message(chat_id=int(chat_id), text="привееет~ я мику! пиши мне когда захочешь уву")
         return
-
     user_text, is_voice_input = await extract_user_text(message, chat_id, user_name)
     if not user_text:
         return
-
     if message.text:
         user_text = clean_mention(user_text) or user_text
-
     await process_message(context, chat_id, user_name, user_text, message.message_id,
                           None, is_voice_input, is_group=False)
 
@@ -655,20 +707,16 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or message.chat.type not in ["group", "supergroup"]:
         return
-
     chat_id = str(message.chat.id)
     user = message.from_user
     user_name = user.first_name if user else "человек"
-
     if chat_id in BLACKLIST:
         return
     if user:
         remember_user(chat_id, user)
-
     bot_me = await context.bot.get_me()
     bot_id = bot_me.id
     bot_username = bot_me.username
-
     is_reply_to_bot = (
         message.reply_to_message
         and message.reply_to_message.from_user
@@ -676,24 +724,18 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     text_for_mention = message.text or message.caption or ""
     mentioned = is_mentioned(text_for_mention, bot_username)
-
     if message.text and is_owner(user):
         if await handle_commands(message.text, chat_id, context, user):
             return
-
     if not mentioned and not is_reply_to_bot:
         return
-
     if message.text and await handle_commands(message.text, chat_id, context, user):
         return
-
     user_text, is_voice_input = await extract_user_text(message, chat_id, user_name)
     if not user_text:
         return
-
     if message.text and mentioned:
         user_text = clean_mention(user_text) or "привет"
-
     await process_message(context, chat_id, user_name, user_text, message.message_id,
                           None, is_voice_input, is_group=True)
 
@@ -704,7 +746,6 @@ async def proactive_loop(app: Application):
             if settings.get("muted", False):
                 await asyncio.sleep(300)
                 continue
-
             now = datetime.utcnow()
             for uid, info in list(private_users.items()):
                 last = info.get("last_proactive")
@@ -715,10 +756,8 @@ async def proactive_loop(app: Application):
                             continue
                     except Exception:
                         pass
-
                 if random.random() > PROACTIVE_CHANCE:
                     continue
-
                 phrase = random.choice(PROACTIVE_PHRASES)
                 try:
                     await app.bot.send_message(chat_id=int(uid), text=phrase)
@@ -728,24 +767,19 @@ async def proactive_loop(app: Application):
                     await asyncio.sleep(2)
                 except Exception as e:
                     print(f"Не смогла написать {uid}:", e)
-
         except Exception as e:
             print("proactive error:", e)
-
         await asyncio.sleep(random.randint(PROACTIVE_MIN, PROACTIVE_MAX))
 
 def main():
     app = Application.builder().token(BOT_TOKEN).request(request).build()
-
     app.add_handler(BusinessConnectionHandler(on_business_connection))
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
-
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE)
         & filters.ChatType.PRIVATE,
         on_private_message
     ))
-
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE)
         & filters.ChatType.GROUPS,
@@ -756,9 +790,8 @@ def main():
         asyncio.create_task(proactive_loop(application))
 
     app.post_init = post_init
-
     print(f"Мику запущена | Админ: @{OWNER_USERNAME}")
-    print(f"Модели: {MODEL_MAIN} / {MODEL_FAST}")
+    print(f"NSFW модель: {MODEL_NSFW}")
     print(f"Мут: {'ДА' if settings.get('muted') else 'НЕТ'}")
     app.run_polling(
         allowed_updates=["business_connection", "business_message", "message"],
