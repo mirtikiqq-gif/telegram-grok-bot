@@ -61,7 +61,7 @@ PROACTIVE_PHRASES = [
 MODEL_MAIN = "openai/gpt-oss-120b"          # обычный чат (Groq)
 MODEL_FAST = "openai/gpt-oss-20b"           # быстрые задачи
 MODEL_VISION = "qwen/qwen3.6-27b"           # фото
-MODEL_NSFW = "inclusionai/ling-3.0-tiny:free"  # жёсткий 18+
+MODEL_NSFW = "meta-llama/llama-3.3-70b-instruct:free"  # жёсткий 18+
 
 request = HTTPXRequest(connect_timeout=30.0, read_timeout=60.0, write_timeout=30.0, pool_timeout=30.0)
 
