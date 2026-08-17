@@ -56,6 +56,11 @@ PROACTIVE_PHRASES = [
     "эхехе, просто написала проверить тебя",
 ]
 
+# Актуальные модели Groq (после 16.08.2026)
+MODEL_MAIN = "openai/gpt-oss-120b"
+MODEL_FAST = "openai/gpt-oss-20b"
+MODEL_VISION = "qwen/qwen3.6-27b"
+
 request = HTTPXRequest(connect_timeout=30.0, read_timeout=60.0, write_timeout=30.0, pool_timeout=30.0)
 
 BASE_PROMPT = """Ты — Мику, милая аниме-тян.
@@ -186,7 +191,7 @@ async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_T
     else:
         print("❌ Business отключен")
 
-async def call_groq(messages, model="llama-3.3-70b-versatile", temperature=0.9, max_tokens=450):
+async def call_groq(messages, model=MODEL_MAIN, temperature=0.9, max_tokens=450):
     try:
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -241,7 +246,7 @@ async def analyze_image(file_path: str, caption: str = "") -> str:
                     {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img}"}}
                 ]
             }],
-            model="qwen/qwen3.6-27b",
+            model=MODEL_VISION,
             temperature=0.6,
             max_tokens=300,
         )
@@ -256,7 +261,7 @@ async def detect_mood(text: str) -> str:
             "role": "system",
             "content": "Определи настроение одним словом: нейтральный, весёлый, грустный, злой, усталый, влюблённый, тревожный, шутит. Только одно слово."
         }, {"role": "user", "content": text}],
-        model="llama-3.1-8b-instant",
+        model=MODEL_FAST,
         temperature=0.1,
         max_tokens=10,
     )
@@ -270,7 +275,7 @@ async def extract_facts(chat_id: str, text: str):
             "role": "system",
             "content": "Извлеки явные факты о человеке. Если нет — пустая строка. Каждый факт с новой строки."
         }, {"role": "user", "content": text}],
-        model="llama-3.1-8b-instant",
+        model=MODEL_FAST,
         temperature=0.1,
         max_tokens=120,
     )
@@ -307,7 +312,7 @@ def split_messages(text: str) -> list:
     return result[:3]
 
 async def maybe_react(context, chat_id, message_id, connection_id=None):
-    if random.random() > 0.3:
+    if random.random() > 0.35:
         return
     try:
         emoji = random.choice(REACTIONS)
@@ -320,7 +325,8 @@ async def maybe_react(context, chat_id, message_id, connection_id=None):
             kwargs["business_connection_id"] = connection_id
         await context.bot.set_message_reaction(**kwargs)
     except Exception as e:
-        print("Реакция:", e)
+        # Реакции в business иногда не работают — не страшно
+        pass
 
 async def text_to_voice(text: str, path: str):
     communicate = edge_tts.Communicate(text, VOICE)
@@ -378,7 +384,10 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
         if not users:
             await context.bot.send_message(text="пока никого не запомнила~", **kwargs)
             return True
-        lines = [f"• {info.get('name', '?')} (@{info['username']})" if info.get("username") else f"• {info.get('name', '?')} (без юза)" for uid, info in list(users.items())[:50]]
+        lines = []
+        for uid, info in list(users.items())[:50]:
+            uname = f"@{info['username']}" if info.get("username") else "без юза"
+            lines.append(f"• {info.get('name', '?')} ({uname})")
         await context.bot.send_message(text="кого знаю:\n" + "\n".join(lines), **kwargs)
         return True
 
@@ -400,7 +409,11 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
             else:
                 not_found.append(p)
         if mentions:
-            await context.bot.send_message(text="эй, вас зовут~ " + " ".join(dict.fromkeys(mentions)), parse_mode="HTML", **kwargs)
+            await context.bot.send_message(
+                text="эй, вас зовут~ " + " ".join(dict.fromkeys(mentions)),
+                parse_mode="HTML",
+                **kwargs
+            )
         if not_found:
             await context.bot.send_message(text="не нашла: " + ", ".join(not_found), **kwargs)
         return True
@@ -429,7 +442,10 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
         role = text_raw.split(" ", 1)[1].strip()
         settings["role"] = role if role.lower() not in ["сброс", "off", "нет"] else None
         save_all()
-        await context.bot.send_message(text=f"роль: {settings['role']}~" if settings["role"] else "роль сброшена~", **kwargs)
+        await context.bot.send_message(
+            text=f"роль: {settings['role']}~" if settings["role"] else "роль сброшена~",
+            **kwargs
+        )
         return True
 
     if text_l in ["/summary", "саммари"]:
@@ -440,9 +456,11 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
         summary = await call_groq(
             [
                 {"role": "system", "content": "Кратко саммаризируй диалог в 2-3 предложениях, мило."},
-                {"role": "user", "content": "\n".join(f"{'Я' if m['role']=='assistant' else 'Он'}: {m['content']}" for m in history[-12:])},
+                {"role": "user", "content": "\n".join(
+                    f"{'Я' if m['role']=='assistant' else 'Он'}: {m['content']}" for m in history[-12:]
+                )},
             ],
-            model="llama-3.1-8b-instant", temperature=0.5, max_tokens=180,
+            model=MODEL_FAST, temperature=0.5, max_tokens=180,
         )
         await context.bot.send_message(text=summary or "не вспомнила >_<", **kwargs)
         return True
@@ -457,7 +475,6 @@ async def handle_commands(text, chat_id, context, user, connection_id=None) -> b
     return False
 
 async def extract_user_text(message, chat_id: str, user_name: str):
-    """Достаёт текст из любого типа сообщения"""
     user_text = None
     is_voice_input = False
 
@@ -542,7 +559,7 @@ async def process_message(context, chat_id, user_name, user_text, message_id,
         chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY:]
 
     messages = [{"role": "system", "content": build_system_prompt(chat_id, mood)}] + chat_histories[chat_id]
-    answer = await call_groq(messages, temperature=0.92, max_tokens=400) or "эээ... затупила >_<"
+    answer = await call_groq(messages, model=MODEL_MAIN, temperature=0.92, max_tokens=400) or "эээ... затупила >_<"
 
     chat_histories[chat_id].append({"role": "assistant", "content": answer})
     save_all()
@@ -620,7 +637,6 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if message.text and await handle_commands(message.text, chat_id, context, user):
         return
 
-    # /start
     if message.text and message.text.startswith("/start"):
         await context.bot.send_message(chat_id=int(chat_id), text="привееет~ я мику! пиши мне когда захочешь уву")
         return
@@ -629,7 +645,6 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not user_text:
         return
 
-    # убираем упоминания если вдруг
     if message.text:
         user_text = clean_mention(user_text) or user_text
 
@@ -683,7 +698,6 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                           None, is_voice_input, is_group=True)
 
 async def proactive_loop(app: Application):
-    """Мику сама иногда пишет людям в личку"""
     await asyncio.sleep(60)
     while True:
         try:
@@ -726,14 +740,12 @@ def main():
     app.add_handler(BusinessConnectionHandler(on_business_connection))
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
 
-    # Личка с ботом
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE)
         & filters.ChatType.PRIVATE,
         on_private_message
     ))
 
-    # Группы
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE)
         & filters.ChatType.GROUPS,
@@ -746,6 +758,7 @@ def main():
     app.post_init = post_init
 
     print(f"Мику запущена | Админ: @{OWNER_USERNAME}")
+    print(f"Модели: {MODEL_MAIN} / {MODEL_FAST}")
     print(f"Мут: {'ДА' if settings.get('muted') else 'НЕТ'}")
     app.run_polling(
         allowed_updates=["business_connection", "business_message", "message"],
